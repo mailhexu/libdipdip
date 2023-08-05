@@ -2174,9 +2174,12 @@ subroutine llsfit_svd(xx,yy,sigma,nfuncs,funcs,chisq,par,var,cov,info)
  real(dp),allocatable :: work(:),Vt(:,:),U(:,:),S(:)
 ! *************************************************************************
 
- npts = assert_eq(SIZE(xx),SIZE(yy),SIZE(sigma),'Wrong size in xx,yy,sigma', __FILE__, __LINE__)
- call assert((npts>=nfuncs),'No. of functions must greater than no. of points', __FILE__, __LINE__)
- ii = assert_eq(nfuncs,SIZE(cov,1),SIZE(cov,2),SIZE(var),'Wrong size in covariance', __FILE__, __LINE__)
+ npts = assert_eq(SIZE(xx),SIZE(yy),SIZE(sigma), &
+         &'Wrong size in xx,yy,sigma', __FILE__, __LINE__)
+ call assert((npts>=nfuncs), &
+         &'No. of functions must greater than no. of points', __FILE__, __LINE__)
+ ii = assert_eq(nfuncs,SIZE(cov,1),SIZE(cov,2),SIZE(var), &
+         &'Wrong size in covariance', __FILE__, __LINE__)
 
  !
  ! === Calculate design matrix and b vector ===

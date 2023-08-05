@@ -24,3 +24,4 @@ cp /home/hexu/projects/abinit/shared/common/src/28_numeric_noabirule/m_sort.F90 
 cp /home/hexu/projects/abinit/shared/common/src/32_util/m_pptools.F90 .
 cp /home/hexu/projects/abinit/shared/common/src/17_libtetra_ext/m_krank.F90 .
 cp /home/hexu/projects/abinit/shared/common/src/32_util/m_special_funcs.F90 .
+cp /home/hexu/cprojects/abinit/shared/common/src/28_numeric_noabirule/m_random_xoroshiro128plus.F90 .

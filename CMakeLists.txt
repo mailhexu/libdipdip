@@ -46,7 +46,6 @@ file(GLOB sourcefile
     "src/abinit/*.F90"
     "src/abinit/xmpi/*.F90"
     "src/abinit/xmpi/*.finc")
-
 #target_include_directories(dipdip PRIVATE "include")
 
 #list(REMOVE_ITEM sourcefile
@@ -73,14 +72,36 @@ if(MPI_LINK_FLAGS)
       LINK_FLAGS "${MPI_Fortran_LINK_FLAGS}")
 endif()
 
+# libmultibinit
+file(GLOB multibinit_sourcefile
+	"src/multibinit/*.F90",
+	"src/multibinit/*.c",
+)
+add_library(multibinit SHARED
+	${multibinit_sourcefile}
+)
+
+target_link_libraries(multibinit dipdip ${lapackblas_libraries} ${MPI_Fortran_LIBRARIES}  ${NETCDF_LIBRARIES_F90})
+
+if(MPI_COMPILE_FLAGS)
+  set_target_properties(dipdip PROPERTIES
+      COMPILE_FLAGS "${MPI_Fortran_COMPILE_FLAGS}")
+endif()
+
+if(MPI_LINK_FLAGS)
+  set_target_properties(dipdip PROPERTIES
+      LINK_FLAGS "${MPI_Fortran_LINK_FLAGS}")
+endif()
+
+
 
 
 # unit test
-#add_executable(unittest
-# src/unittest.F90
-#  )
+add_executable(testm
+ src/main/main.F90
+  )
 #
-#target_link_libraries(unittest wanntb ${lapackblas_libraries} ${NETCDF_LIBRARIES_F90} )
+target_link_libraries(testm dipdip ${lapackblas_libraries} ${NETCDF_LIBRARIES_F90} )
 #
 ## computeU
 #add_executable(computeU

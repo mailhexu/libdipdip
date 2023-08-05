@@ -1,0 +1,4655 @@
+!****f* ABINIT/m_polynomal_coeff
+!!
+!! NAME
+!! m_polynomial_coeff
+!!
+!! FUNCTION
+!! Module with the datatype polynomial coefficients
+!!
+!! COPYRIGHT
+!! Copyright (C) 2010-2022 ABINIT group (AM)
+!! This file is distributed under the terms of the
+!! GNU General Public Licence, see ~abinit/COPYING
+!! or http://www.gnu.org/copyleft/gpl.txt .
+!! For the initials of contributors, see ~abinit/doc/developers/contributors.txt .
+!!
+!! SOURCE
+
+
+#if defined HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "abi_common.h"
+
+module m_polynomial_coeff
+
+ use defs_basis
+ use m_errors
+ use m_abicore
+ use m_polynomial_term
+ use m_xmpi
+#ifdef HAVE_MPI2
+ use mpi
+#endif
+
+ use m_sort,      only : sort_dp
+ use m_io_tools,  only : open_file, get_unit
+ use m_symtk,     only : symchk, symatm
+ use m_crystal,   only : crystal_t,symbols_crystal
+ use m_supercell, only : getPBCIndexes_supercell,distance_supercell,findBound_supercell
+ !use m_geometry,  only : xcart2xred,metric
+ use m_dtfil,     only : isfile
+ use m_hashtable_strval, only: hash_table_t
+ use m_dynamic_array, only: int2d_array_type
+
+
+ implicit none
+
+ type,public :: SymPairs_t
+   integer :: ncoeff_sym,nstr_sym
+   integer,allocatable :: list_symcoeff(:,:,:),list_symstr(:,:,:)
+   integer :: natom,nrpt, nsym
+   real(dp)   :: cutoff
+   !arrays
+   type(crystal_t), pointer :: crystal
+   integer, allocatable :: cell(:,:)
+   real(dp), allocatable:: dist(:, :, :, :)
+   character(len=5),allocatable :: symbols(:)
+   integer :: sc_size(3)
+   real(dp):: range_ifc(3)
+   integer :: fit_iatom=-1
+ contains
+   procedure :: init => SymPairs_t_init
+   procedure :: free => SymPairs_t_free
+   procedure :: generateTerms => SymPairs_t_generateTerms
+ end type SymPairs_T
+
+ type, private :: symlist_t
+   integer :: nsym=0, power=0
+   integer(dp) :: max=0
+   integer :: counter=0
+ contains
+   procedure :: init=> symlist_init
+   procedure :: next => symlist_next
+   procedure :: free => symlist_free
+ end type symlist_t
+
+ type, private :: IrreducibleCombinations_t
+   type(hash_table_t) :: table
+   type(int2d_array_type) :: array
+ contains
+   procedure :: init => IrreducibleCombinations_init
+   procedure :: free => IrreducibleCombinations_free
+   procedure :: add_irr => IrreducibleCombinations_add_irr
+ end type IrreducibleCombinations_T
+
+ public :: polynomial_coeff_broadcast
+ public :: polynomial_coeff_evaluate
+ public :: polynomial_coeff_free
+ public :: polynomial_coeff_init
+ public :: prepare_for_getList
+ public :: get_crystal_cutoff
+ public :: polynomial_coeff_getList
+ public :: polynomial_coeff_getName
+ public :: polynomial_coeff_getNorder
+ public :: polynomial_coeff_getOrder1
+ public :: polynomial_coeff_MPIrecv
+ public :: polynomial_coeff_MPIsend
+ public :: polynomial_coeff_setName
+ public :: polynomial_coeff_setCoefficient
+ public :: polynomial_coeff_writeXML
+ public :: polynomial_coeff_getEvenAnhaStrain
+ public :: coeffs_list_copy
+ public :: coeffs_list_conc
+ public :: coeffs_list_conc_onsite
+ public :: coeffs_list_append
+ public :: generateTermsFromList
+ public :: find_irpt
+ private :: computeNorder
+ private :: computeCombinationFromList
+ private :: computeSymmetricCombinations
+ !private :: computeSymmetricCombinations_old
+ private :: getCoeffFromList
+ private :: reduce_zero_combinations
+ private :: check_irreducibility
+ private :: sort_combination_list
+ private :: sort_combination
+
+
+!!***
+
+!!****t* m_polynomial_coeff/polynomial_coeff_type
+!! NAME
+!! polynomial_coeff_type
+!!
+!! FUNCTION
+!! structure for a polynomial coefficient
+!! contains the value of the coefficient and a
+!! list of terms (displacements and/or strain) relating to the coefficient by symmetry
+!!
+!! SOURCE
+
+ type, public :: polynomial_coeff_type
+
+   character(len=200) :: name = ""
+!     Name of the polynomial_coeff (Sr_y-O1_y)^3) for example
+
+   integer :: nterm = 0
+!     Number of terms (short range interaction) for this polynomial_coeff
+
+   real(dp) :: coefficient = zero
+!     coefficient = value of the coefficient of this term
+!     \frac{\partial E^{k}}{\partial \tau^{k}}
+
+   type(polynomial_term_type),dimension(:),allocatable :: terms
+!     polynomial_term(nterm)<type(polynomial_term)>
+!     contains all the displacements for this coefficient
+
+ end type polynomial_coeff_type
+!!***
+
+ interface operator (==)
+   module procedure coeffs_compare
+ end interface operator (==)
+
+interface operator (+)
+   module procedure coeffs_list_conc
+end interface operator (+)
+
+ interface assignment (=)
+   module procedure coeffs_list_copy
+ end interface assignment (=)
+
+
+!==
+ type, public:: SymmetryAdaptedTermsGenerator
+
+ end type SymmetryAdaptedTermsGenerator
+
+
+
+CONTAINS  !===========================================================================================
+
+
+!!****f* m_polynomial_coeff/polynomial_coeff_init
+!!
+!! NAME
+!! polynomial_coeff_init
+!!
+!! FUNCTION
+!! Initialize a polynomial_coeff datatype
+!!
+!! INPUTS
+!!  name     = Name of the polynomial_coeff (Sr_y-O1_y)^3) for example
+!!  nterm    = Number of terms (short range interaction) for this polynomial_coeff
+!!  coefficient  = Value of the coefficient of this term
+!!  terms(nterm)<type(polynomial_term)> = array of polynomial_term_type
+!!  check   = TRUE if this list of terms has to be check. We remove the symetric of equivalent terms
+!!                  for example:  ((Sr_y-O1_y)^1 and -1*(Sr_y-O1_y)^1 => zero
+!!            FALSE, defaut, do nothing
+!! OUTPUT
+!!   polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype to be initialized
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_init(coefficient,nterm,polynomial_coeff,terms,name,check)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ integer, intent(in) :: nterm
+ real(dp),intent(in) :: coefficient
+ logical,optional,intent(in) :: check
+!arrays
+ character(len=200),optional,intent(in) :: name
+ type(polynomial_term_type),intent(in) :: terms(nterm)
+ type(polynomial_coeff_type), intent(out) :: polynomial_coeff
+!Local variables-------------------------------
+!scalar
+ integer :: iterm1,iterm2
+ integer :: ii,nterm_tmp
+ real(dp):: coefficient_tmp
+ logical :: check_in
+!arrays
+ real(dp) :: weights(nterm)
+ character(len=200) :: name_tmp
+! *************************************************************************
+!First free before initilisation
+ call polynomial_coeff_free(polynomial_coeff)
+ check_in = .false.
+ if(present(check)) check_in = check
+ if(check_in)then
+!  Check if the list of term is available or contains identical terms
+!  in this case, remove all the not needed terms
+   nterm_tmp = 0
+   weights(:) = one
+   do iterm1=1,nterm
+     if(abs(weights(iterm1)) < tol16)cycle ! FIXME: do nothing?
+     weights(iterm1) = terms(iterm1)%weight
+     do iterm2=iterm1+1,nterm
+       if(abs(weights(iterm2)) < tol16)cycle
+!      if the terms are identical we check the weight
+       if(terms(iterm1)==terms(iterm2))then
+         weights(iterm1) = weights(iterm1) + terms(iterm2)%weight
+         weights(iterm2) = 0
+       end if
+     end do
+     if(abs(weights(iterm1)) > tol16) then
+       ! FIXME: weights(iterm1) = 1 ?
+       weights(iterm1)= anint(weights(iterm1)/weights(iterm1))
+     end if
+   end do
+
+
+!  Count the number of terms
+   ! TODO: replace by: ??
+   !nterm_tmp=count(abs(weights) > tol16)
+   nterm_tmp = 0
+   do iterm1=1,nterm
+     if(abs(weights(iterm1)) > tol16)then
+       nterm_tmp = nterm_tmp + 1
+     end if
+   end do
+
+   if (nterm_tmp ==0)then
+     coefficient_tmp = 0.0
+   else
+     coefficient_tmp = coefficient
+   end if
+
+ else
+   nterm_tmp = nterm
+   coefficient_tmp = coefficient
+   weights(:) = terms(:)%weight
+ end if!end Check
+
+ if(present(name))then
+   name_tmp = name
+ else
+   name_tmp = ""
+ end if
+
+
+!Initilisation
+ polynomial_coeff%name = name_tmp
+ polynomial_coeff%nterm = nterm_tmp
+ polynomial_coeff%coefficient = coefficient_tmp
+ ABI_MALLOC(polynomial_coeff%terms,(polynomial_coeff%nterm))
+ iterm1 = 0
+ do ii = 1,nterm
+   if(abs(weights(ii)) > tol16)then
+     iterm1 = iterm1 + 1
+     call polynomial_term_init(terms(ii)%atindx,terms(ii)%cell,terms(ii)%direction,terms(ii)%ndisp,&
+&                              terms(ii)%nstrain,polynomial_coeff%terms(iterm1),terms(ii)%power_disp,&
+&                              terms(ii)%power_strain,terms(ii)%strain,terms(ii)%weight)
+   end if
+ end do
+end subroutine polynomial_coeff_init
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_free
+!!
+!! NAME
+!! polynomial_coeff_free
+!!
+!! FUNCTION
+!! Free polynomial_coeff datatype
+!!
+!! INPUTS
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! OUTPUT
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_free(polynomial_coeff)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+!arrays
+ type(polynomial_coeff_type), intent(inout) :: polynomial_coeff
+!Local variables-------------------------------
+!scalar
+ integer :: ii
+!arrays
+
+! *************************************************************************
+
+ if(allocated(polynomial_coeff%terms))then
+   do ii = 1,polynomial_coeff%nterm
+     call polynomial_term_free(polynomial_coeff%terms(ii))
+   end do
+   ABI_FREE(polynomial_coeff%terms)
+ end if
+ polynomial_coeff%name = ""
+ polynomial_coeff%nterm = 0
+ polynomial_coeff%coefficient = zero
+
+
+end subroutine polynomial_coeff_free
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_list_free
+!!
+!! NAME
+!! polynomial_coeff_list_free
+!!
+!! FUNCTION
+!! Free polynomial_coeff datatype
+!!
+!! INPUTS
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! OUTPUT
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_list_free(polynomial_coeff_list)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+!arrays
+ type(polynomial_coeff_type),allocatable, intent(inout) :: polynomial_coeff_list(:)
+!Local variables-------------------------------
+!scalar
+ integer :: i,ncoeff
+!arrays
+
+! *************************************************************************
+
+!Free output
+ if(allocated(polynomial_coeff_list))then
+   ncoeff = size(polynomial_coeff_list)
+   do i=1,ncoeff
+      call polynomial_coeff_free(polynomial_coeff_list(i))
+    enddo
+   ABI_FREE(polynomial_coeff_list)
+ endif
+
+end subroutine polynomial_coeff_list_free
+!!***
+
+
+
+!!****f* m_polynomial_coeff/polynomial_coeff_setCoefficient
+!!
+!! NAME
+!! polynomial_coeff_setCoefficient
+!!
+!! FUNCTION
+!! set the coefficient for of polynomial_coeff
+!!
+!! INPUTS
+!! coefficient = coefficient of this coefficient
+!!
+!! OUTPUT
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_setCoefficient(coefficient,polynomial_coeff)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ real(dp),intent(in) :: coefficient
+!arrays
+ type(polynomial_coeff_type), intent(inout) :: polynomial_coeff
+!Local variables-------------------------------
+!scalar
+!arrays
+! *************************************************************************
+
+ polynomial_coeff%coefficient = coefficient
+
+end subroutine polynomial_coeff_setCoefficient
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_setName
+!!
+!! NAME
+!! polynomial_coeff_setName
+!!
+!! FUNCTION
+!! set the name of a  polynomial_coeff type
+!!
+!! INPUTS
+!! name = name of the coeff
+!!
+!! OUTPUT
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_setName(name,polynomial_coeff)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+!arrays
+ character(len=200),intent(in) :: name
+ type(polynomial_coeff_type), intent(inout) :: polynomial_coeff
+!Local variables-------------------------------
+!scalar
+!arrays
+! *************************************************************************
+
+ polynomial_coeff%name = name
+
+end subroutine polynomial_coeff_setName
+!!***
+
+
+!!****f* m_polynomial_coeff/polynomial_coeff_getName
+!!
+!! NAME
+!! polynomial_coeff_getName
+!!
+!! FUNCTION
+!! get the name of a polynomial coefficient
+!!
+!! INPUTS
+!! natom = number of atoms
+!! polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!! symbols(natom)  =  array with the atomic symbol:["Sr","Ru","O1","O2","O3"]
+!! recompute = (optional) flag to set if the name has to be recomputed
+!! iterm = (optional) number of the term used for the name
+!!
+!! OUTPUT
+!! name = name xof the coefficients
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_getName(name,polynomial_coeff,symbols,recompute,iterm)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ integer,optional,intent(in) :: iterm
+!arrays
+ character(len=5),intent(in) :: symbols(:)
+ character(len=200),intent(out):: name
+ type(polynomial_coeff_type),optional, intent(in) :: polynomial_coeff
+ logical,optional,intent(in) :: recompute
+!Local variables-------------------------------
+!scalar
+ integer :: ii,idisp,iterm_in
+ logical :: need_recompute
+!arrays
+ integer :: cell_atm1(3),cell_atm2(3)
+ character(len=1) :: mutodir(9) = (/"x","y","z","1","2","3","4","5","6"/)
+ character(len=1) :: dir
+ character(len=2) :: power_disp,power_dispchar
+ character(len=20) :: atm1,atm2
+ character(len=100):: atm1_tmp,atm2_tmp
+ character(len=200):: text
+ character(len=500):: message
+ ! *************************************************************************
+
+ !Reset output
+ name=""
+ iterm_in = 1
+
+ !Set the optional arguments
+ need_recompute = .FALSE.
+ if(present(recompute)) need_recompute = recompute
+ if(present(iterm)) then
+   iterm_in = iterm
+ else
+   if(need_recompute)then
+     iterm_in = -1
+     do ii=1,polynomial_coeff%nterm
+       !      Find the index of the ref
+       if(iterm_in==-1) then !Need to find the reference term
+         do idisp=1,polynomial_coeff%terms(ii)%ndisp
+           if(polynomial_coeff%terms(ii)%direction(idisp) > 0) then
+             iterm_in = ii
+             if(any(polynomial_coeff%terms(ii)%cell(:,1,idisp) /= 0).or.&
+               &               any(polynomial_coeff%terms(ii)%cell(:,2,idisp) /= 0)) then
+               iterm_in = -1
+               exit
+             end if
+           end if
+         end do!end do disp
+       else
+         exit
+       end if
+     end do!end do term
+     !    If not find, we set to the first element
+     if(iterm_in==-1) iterm_in = 1
+   else
+     iterm_in = 1
+   end if
+ end if
+ !Do check
+ if(iterm_in > polynomial_coeff%nterm.or.iterm_in < 0) then
+   write(message, '(5a)')&
+     &      ' The number of the requested term for the generation of',ch10,&
+     &      'the name of the coefficient is not possible.',ch10,&
+     &      'Action: Contact Abinit group.'
+   ABI_BUG(message)
+ end if
+
+ if(polynomial_coeff%name /= "".and..not.need_recompute)then
+   name = polynomial_coeff%name
+ else
+!  Nedd to recompute
+   do idisp=1,polynomial_coeff%terms(iterm_in)%ndisp
+     text = ""
+     !Fill variables for this displacement
+     write(power_dispchar,'(I0)') polynomial_coeff%terms(iterm_in)%power_disp(idisp)
+     power_disp=trim(power_dispchar)
+
+     atm1=symbols(polynomial_coeff%terms(iterm_in)%atindx(1,idisp))
+     atm2=symbols(polynomial_coeff%terms(iterm_in)%atindx(2,idisp))
+     dir=mutodir(polynomial_coeff%terms(iterm_in)%direction(idisp))
+     cell_atm1=polynomial_coeff%terms(iterm_in)%cell(:,1,idisp)
+     cell_atm2=polynomial_coeff%terms(iterm_in)%cell(:,2,idisp)
+!    Construct ATM1
+     if (any(cell_atm1(:) /= 0) )then
+       write(atm1_tmp,'(4a,I0,a,I0,a,I0,a)')  trim(atm1),"_",dir,"[",cell_atm1(1)," ",&
+&                                               cell_atm1(2)," ",cell_atm1(3),"]"
+       else
+       atm1_tmp = trim(atm1)//"_"//dir
+     end if
+!      Construct ATM2
+     if(any(cell_atm2(:) /= 0))then
+       write(atm2_tmp,'(4a,I0,a,I0,a,I0,a)')  trim(atm2),"_",dir,"[",cell_atm2(1)," ",&
+ &                                              cell_atm2(2)," ",cell_atm2(3),"]"
+     else
+       atm2_tmp = trim(atm2)//"_"//dir
+     end if
+     text="("//trim(atm1_tmp)//"-"//trim(atm2_tmp)//")^"//power_disp
+     name = trim(name)//trim(text)
+   end do
+   !Strain case
+   do idisp=1,polynomial_coeff%terms(iterm_in)%nstrain
+     write(power_dispchar,'(I0)') polynomial_coeff%terms(iterm_in)%power_strain(idisp)
+     power_disp=trim(power_dispchar)
+     dir=mutodir(3+polynomial_coeff%terms(iterm_in)%strain(idisp))
+     text="("//"eta_"//trim(dir)//")^"//power_disp
+     name = trim(name)//trim(text)
+   end do
+ end if
+
+end subroutine polynomial_coeff_getName
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_broadcast
+!! NAME
+!! polynomial_coeff_broadcast
+!!
+!! FUNCTION
+!!  MPI broadcast  polynomial_coefficent datatype
+!!
+!! INPUTS
+!!  source = rank of source
+!!  comm = MPI communicator
+!!
+!! SIDE EFFECTS
+!!  coefficients<type(polynomial_coefficent_type)>= Input if node is source,
+!!                              other nodes returns with a completely initialized instance.
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_broadcast(coefficients, source, comm)
+
+ implicit none
+
+!Arguments ------------------------------------
+!array
+ type(polynomial_coeff_type),intent(inout) :: coefficients
+ integer, intent(in) :: source,comm
+
+!Local variables-------------------------------
+!scalars
+ integer :: ierr,ii
+!arrays
+
+! *************************************************************************
+
+
+ if (xmpi_comm_size(comm) == 1) return
+
+! Free the output
+ if (xmpi_comm_rank(comm) /= source) then
+   call polynomial_coeff_free(coefficients)
+ end if
+
+ ! Transmit variables
+  call xmpi_bcast(coefficients%name, source, comm, ierr)
+  call xmpi_bcast(coefficients%nterm, source, comm, ierr)
+  call xmpi_bcast(coefficients%coefficient, source, comm, ierr)
+
+ !Allocate arrays on the other nodes.
+  if (xmpi_comm_rank(comm) /= source) then
+    ABI_MALLOC(coefficients%terms,(coefficients%nterm))
+    do ii=1,coefficients%nterm
+      call polynomial_term_free(coefficients%terms(ii))
+    end do
+  end if
+! Set the number of term on each node (needed for allocations of array)
+  do ii = 1,coefficients%nterm
+    call xmpi_bcast(coefficients%terms(ii)%ndisp, source, comm, ierr)
+    call xmpi_bcast(coefficients%terms(ii)%nstrain, source, comm, ierr)
+  end do
+
+! Allocate arrays on the other nodes
+  if (xmpi_comm_rank(comm) /= source) then
+    do ii = 1,coefficients%nterm
+      ABI_MALLOC(coefficients%terms(ii)%atindx,(2,coefficients%terms(ii)%ndisp))
+      coefficients%terms(ii)%atindx = 0
+      ABI_MALLOC(coefficients%terms(ii)%direction,(coefficients%terms(ii)%ndisp))
+      ABI_MALLOC(coefficients%terms(ii)%cell,(3,2,coefficients%terms(ii)%ndisp))
+      ABI_MALLOC(coefficients%terms(ii)%power_disp,(coefficients%terms(ii)%ndisp))
+      ABI_MALLOC(coefficients%terms(ii)%power_strain,(coefficients%terms(ii)%nstrain))
+      ABI_MALLOC(coefficients%terms(ii)%strain,(coefficients%terms(ii)%nstrain))
+    end do
+  end if
+
+! Transfert value
+  do ii = 1,coefficients%nterm
+      call xmpi_bcast(coefficients%terms(ii)%weight, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%atindx, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%direction, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%cell, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%power_disp, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%power_strain, source, comm, ierr)
+      call xmpi_bcast(coefficients%terms(ii)%strain, source, comm, ierr)
+  end do
+
+
+end subroutine polynomial_coeff_broadcast
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_MPIsend
+!! NAME
+!! polynomial_coeff_MPIsend
+!!
+!! FUNCTION
+!!  MPI send the polynomial_coefficent datatype
+!!
+!! INPUTS
+!!   tag = tag of the message to send
+!!   dest= rank of Dest
+!!   comm= MPI communicator
+!!
+!! SIDE EFFECTS
+!!   polynomial_coeff<type(polynomial_coeff)> = polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_MPIsend(coefficients, tag, dest, comm)
+
+ implicit none
+
+!Arguments ------------------------------------
+!array
+ type(polynomial_coeff_type),intent(inout) :: coefficients
+ integer, intent(in) :: dest,comm,tag
+
+!Local variables-------------------------------
+!scalars
+ integer :: ierr,ii
+ integer :: my_rank
+!arrays
+
+! *************************************************************************
+
+ if (xmpi_comm_size(comm) == 1) return
+
+  my_rank = xmpi_comm_rank(comm)
+! Transmit variables
+  call xmpi_send(coefficients%name, dest, 9*tag+0, comm, ierr)
+  call xmpi_send(coefficients%nterm, dest, 9*tag+1, comm, ierr)
+  call xmpi_send(coefficients%coefficient, dest, 9*tag+2, comm, ierr)
+
+! Set the number of term on each node (needed for allocations of array)
+  do ii = 1,coefficients%nterm
+    call xmpi_send(coefficients%terms(ii)%ndisp, dest, 9*tag+3, comm, ierr)
+    call xmpi_send(coefficients%terms(ii)%nstrain, dest, 9*tag+4, comm, ierr)
+  end do
+
+! Transfert value
+  do ii = 1,coefficients%nterm
+      call xmpi_send(coefficients%terms(ii)%weight, dest, 9*tag+5, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%atindx, dest, 9*tag+6, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%direction, dest, 9*tag+7, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%cell, dest, 9*tag+8, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%power_disp, dest, 9*tag+9, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%power_strain, dest, 9*tag+10, comm, ierr)
+      call xmpi_send(coefficients%terms(ii)%strain, dest, 9*tag+11, comm, ierr)
+  end do
+
+end subroutine polynomial_coeff_MPIsend
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_MPIrecv
+!! NAME
+!! polynomial_coeff_MPIrecv
+!!
+!! FUNCTION
+!!  MPI receive the polynomial_coefficent datatype
+!!
+!! INPUTS
+!!   tag = tag of the message to receive
+!!   source = rank of Source
+!!   comm = MPI communicator
+!!
+!! SIDE EFFECTS
+!!   coefficients<type(polynomial_coefficent_type)>=  polynomial_coeff datatype
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_MPIrecv(coefficients, tag, source, comm)
+
+ implicit none
+
+!Arguments ------------------------------------
+!array
+ type(polynomial_coeff_type),intent(inout) :: coefficients
+ integer, intent(in) :: source,comm,tag
+
+!Local variables-------------------------------
+!scalars
+ integer :: ierr,ii
+!arrays
+
+! *************************************************************************
+
+ if (xmpi_comm_size(comm) == 1) return
+
+
+! Free the output
+  call polynomial_coeff_free(coefficients)
+
+ ! Transmit variables
+  call xmpi_recv(coefficients%name, source, 9*tag+0, comm, ierr)
+  call xmpi_recv(coefficients%nterm, source, 9*tag+1, comm, ierr)
+  call xmpi_recv(coefficients%coefficient, source, 9*tag+2, comm, ierr)
+
+ !Allocate arrays on the other nodes.
+  ABI_MALLOC(coefficients%terms,(coefficients%nterm))
+  do ii=1,coefficients%nterm
+    call polynomial_term_free(coefficients%terms(ii))
+  end do
+
+! Set the number of term on each node (needed for allocations of array)
+  do ii = 1,coefficients%nterm
+    call xmpi_recv(coefficients%terms(ii)%ndisp, source, 9*tag+3, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%nstrain, source, 9*tag+4, comm, ierr)
+  end do
+
+! Allocate arrays on the other nodes
+  do ii = 1,coefficients%nterm
+    ABI_MALLOC(coefficients%terms(ii)%atindx,(2,coefficients%terms(ii)%ndisp))
+    coefficients%terms(ii)%atindx = 0
+    ABI_MALLOC(coefficients%terms(ii)%direction,(coefficients%terms(ii)%ndisp))
+    ABI_MALLOC(coefficients%terms(ii)%cell,(3,2,coefficients%terms(ii)%ndisp))
+    ABI_MALLOC(coefficients%terms(ii)%power_disp,(coefficients%terms(ii)%ndisp))
+    ABI_MALLOC(coefficients%terms(ii)%power_strain,(coefficients%terms(ii)%nstrain))
+    ABI_MALLOC(coefficients%terms(ii)%strain,(coefficients%terms(ii)%nstrain))
+  end do
+
+! Transfert value
+  do ii = 1,coefficients%nterm
+    call xmpi_recv(coefficients%terms(ii)%weight, source, 9*tag+5, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%atindx, source, 9*tag+6, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%direction, source, 9*tag+7, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%cell, source, 9*tag+8, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%power_disp, source, 9*tag+9, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%power_strain, source, 9*tag+10, comm, ierr)
+    call xmpi_recv(coefficients%terms(ii)%strain, source, 9*tag+11, comm, ierr)
+  end do
+
+end subroutine polynomial_coeff_MPIrecv
+!!***
+
+!!****f*m_polynomial_coeff/polynomial_coeff_writeXML
+!! NAME
+!! polynomial_coeff_writeXML
+!!
+!! FUNCTION
+!! This routine print the coefficents into XML format
+!!
+!! COPYRIGHT
+!! Copyright (C) 2000-2022 ABINIT group (AM)
+!! This file is distributed under the terms of the
+!! GNU General Public License, see ~abinit/COPYING
+!! or http://www.gnu.org/copyleft/gpl.txt .
+!! For the initials of contributors, see ~abinit/doc/developers/contributors.txt .
+!!
+!! INPUTS
+!! coeffs(ncoeffs)<type(polynomial_coeff)> = array of polynomial_coeff datatype
+!! ncoeff = number of coeffs to print
+!! filename = optional,the name of output file
+!!                     default is coefficients.xml
+!! unit = optional,unit of the output file
+!! newfile = optional, TRUE the coefficients are print in new XML (print the headers)
+!!                     FALSE (requieres unit) will not print the headers
+!! replace = optional, TRUE replace filename if filename exists
+!!                     FALSE, default not replace if filename exists
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_writeXML(coeffs,ncoeff,filename,unit,newfile,replace)
+
+  implicit none
+
+!Arguments ------------------------------------
+!scalars
+  integer, intent(in) :: ncoeff
+  integer,optional,intent(in) :: unit
+  logical,optional,intent(in) :: newfile,replace
+!arrays
+  type(polynomial_coeff_type), intent(in) :: coeffs(ncoeff)
+  character(len=fnlen),optional,intent(in) :: filename
+!Local variables-------------------------------
+!scalar
+ integer :: icoeff,idisp,iterm
+ integer :: unit_xml
+ logical :: need_header,need_to_replace
+ character(len=500) :: message
+ character(len=fnlen) :: namefile
+ character(len=1)  :: direction
+
+!arrays
+
+! *************************************************************************
+
+!fill the default
+ unit_xml = get_unit()
+
+!Check the inputs
+ if(present(filename))then
+   namefile=trim(filename)
+ else
+   namefile='coefficients.xml'
+ end if
+
+ need_to_replace = .FALSE.
+ if(present(replace))then
+   need_to_replace = replace
+ end if
+
+ need_header = .TRUE.
+ if(present(newfile))then
+   if (newfile) then
+     unit_xml = get_unit()
+     need_header = .TRUE.
+
+     if(.not. need_to_replace) call isfile(namefile,'new')
+   else
+     if(.not.present(unit))then
+       write(message,'(a,a)')' You  need to specified the unit'
+       ABI_ERROR(message)
+     else
+       need_header = .FALSE.
+       unit_xml = unit
+     end if
+   end if
+ end if
+ if (size(coeffs) /= ncoeff) then
+   write(message,'(a,a)')' The number of coeffs does not correspond to ncoeff'
+   ABI_ERROR(message)
+ end if
+
+!Print the coefficients into XML file
+ if(ncoeff>0)then
+   if(need_header)then
+!    open new file
+     if (open_file(namefile,message,unit=unit_xml,form="formatted",&
+&         status="new",action="write") /= 0) then
+       ABI_ERROR(message)
+     end if
+   else
+!     just open the file to append the coefficient
+     open(unit=unit_xml,file=namefile,position="append")
+   end if
+
+!  Write header
+   if (need_header)then
+     write(message,'(a,a,a)')ch10,&
+&         ' Generation of the xml file for the fitted polynomial in ',trim(namefile)
+
+     call wrtout(ab_out,message,'COLL')
+     call wrtout(std_out,message,'COLL')
+     WRITE(unit_xml,'("<?xml version=""1.0"" ?>")')
+   end if
+   WRITE(unit_xml,'("<Heff_definition>")')
+   !   Close header
+   do icoeff = 1, ncoeff
+      WRITE(unit_xml,'("  <coefficient number=""",I0,""" value=""",E19.10,""" text=""",a,""">")') &
+         icoeff,coeffs(icoeff)%coefficient,trim(coeffs(icoeff)%name)
+      do iterm = 1,coeffs(icoeff)%nterm
+        WRITE(unit_xml,'("    <term weight=""",F9.6,""">")') &
+          coeffs(icoeff)%terms(iterm)%weight
+        do idisp=1,coeffs(icoeff)%terms(iterm)%ndisp
+!         Atomic displacement case
+          select case(coeffs(icoeff)%terms(iterm)%direction(idisp))
+          case(1)
+            direction ="x"
+          case(2)
+            direction ="y"
+          case(3)
+            direction ="z"
+          end select
+          WRITE(unit_xml,'(a,I0,a,I0,3a,I0,a)') "      <displacement_diff atom_a=""",&
+&                         coeffs(icoeff)%terms(iterm)%atindx(1,idisp)-1,""" atom_b=""",&
+&                         coeffs(icoeff)%terms(iterm)%atindx(2,idisp)-1,""" direction=""",&
+&                         direction,""" power=""",coeffs(icoeff)%terms(iterm)%power_disp(idisp),&
+&                           """>"
+          WRITE(unit_xml,'("        <cell_a>")',advance='no')
+          WRITE(unit_xml,'(3(I0,a,I0,a,I0))',advance='no')&
+&           coeffs(icoeff)%terms(iterm)%cell(1,1,idisp)," ",&
+&           coeffs(icoeff)%terms(iterm)%cell(2,1,idisp)," ",&
+&           coeffs(icoeff)%terms(iterm)%cell(3,1,idisp)
+          WRITE(unit_xml,'("</cell_a>")')
+          WRITE(unit_xml,'("        <cell_b>")',advance='no')
+          WRITE(unit_xml,'(3(I0,a,I0,a,I0))',advance='no')&
+&           coeffs(icoeff)%terms(iterm)%cell(1,2,idisp)," ",&
+&           coeffs(icoeff)%terms(iterm)%cell(2,2,idisp)," ",&
+&           coeffs(icoeff)%terms(iterm)%cell(3,2,idisp)
+          WRITE(unit_xml,'("</cell_b>")')
+          WRITE(unit_xml,'("      </displacement_diff>")')
+        end do
+        do idisp=1,coeffs(icoeff)%terms(iterm)%nstrain
+!         Strain case
+          WRITE(unit_xml,'("      <strain power=""",i2,""" voigt=""",i2,"""/>")')&
+&               coeffs(icoeff)%terms(iterm)%power_strain(idisp),&
+&               coeffs(icoeff)%terms(iterm)%strain(idisp)
+        end do
+        WRITE(unit_xml,'("    </term>")')
+      end do
+      WRITE(unit_xml,'("  </coefficient>")')
+    end do
+    WRITE(unit_xml,'("</Heff_definition>")')
+!   Close file
+    CLOSE(unit_xml)
+  end if
+
+end subroutine polynomial_coeff_writeXML
+
+
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_evaluate
+!! NAME
+!!  polynomial_coeff_evaluate
+!!
+!! FUNCTION
+!!  Compute the energy related to the coefficients from
+!!  fitted polynome
+!!
+!! INPUTS
+!!  coefficients(ncoeff)<type(polynomial_coeff_type)> = list of coefficients
+!!  disp(3,natom_sc) = atomics displacement between configuration and the reference
+!!  natom_sc = number of atoms in the supercell
+!!  natom_uc = number of atoms in the unit cell
+!!  ncoeff   = number of coefficients
+!!  sc_size(3) = size of the supercell (2 2 2 for example)
+!!  strain(6) = strain between configuration and the reference
+!!  cells(ncell) = number of the cells into the supercell (1,2,3,4,5)
+!!  ncell   = total number of cell to treat by this cpu
+!!  index_cells(3,ncell) = indexes of the cells into  supercell (-1 -1 -1 ,...,1 1 1)
+!!  comm=MPI communicator
+!!
+!! OUTPUT
+!!  energy = contribution to the energy
+!!  energy_coeff(ncoeff) = energy contribution of each anharmonic term
+!!  fcart(3,natom) = contribution  to the forces
+!!  strten(6) = contribution to the stress tensor
+!!
+!! SOURCE
+!!
+subroutine polynomial_coeff_evaluate(coefficients,disp,energy,energy_coeff,fcart,natom_sc,natom_uc,ncoeff,sc_size,&
+&                                    strain,strten,ncell,index_cells,comm,filename)
+
+!Arguments ------------------------------------
+! scalar
+  real(dp),intent(out):: energy
+  integer, intent(in) :: ncell,ncoeff,natom_sc,natom_uc
+  integer, intent(in) :: comm
+  character(len=fnlen),optional,intent(in) :: filename
+! array
+  real(dp),intent(out):: strten(6)
+  real(dp),intent(in) :: strain(6)
+  real(dp),intent(out):: fcart(3,natom_sc)
+  real(dp),intent(in) :: disp(3,natom_sc)
+  real(dp),optional,intent(out):: energy_coeff(ncoeff)
+  integer,intent(in) :: index_cells(4,ncell)
+  integer,intent(in) :: sc_size(3)
+  type(polynomial_coeff_type),intent(in) :: coefficients(ncoeff)
+ !Local variables-------------------------------
+! scalar
+  integer :: i1,i2,i3,ia1,ib1,ia2,ib2,idir1,idir2,ierr,ii
+  integer :: icoeff,iterm,idisp1,idisp2,idisp1_strain,idisp2_strain,icell,ndisp
+  integer :: nstrain,ndisp_tot,power_disp,power_strain,unit_out
+  real(dp):: coeff,disp1,disp2,tmp1,tmp2,tmp3,weight
+  logical :: file_opened
+! array
+  integer :: cell_atoma1(3),cell_atoma2(3)
+  integer :: cell_atomb1(3),cell_atomb2(3)
+  character(len=500) :: msg
+  character(len=fnlen) :: name_file
+! *************************************************************************
+
+! Check
+  if (any(sc_size <= 0)) then
+    write(msg,'(a,a)')' No supercell found for getEnergy'
+    ABI_ERROR(msg)
+  end if
+
+  if(present(filename)) name_file = filename
+
+! Initialisation of variables
+  energy     = zero
+  fcart(:,:) = zero
+  strten(:)  = zero
+  energy_coeff(:) = zero
+  do icell = 1,ncell
+    ii = index_cells(4,icell);
+    i1=index_cells(1,icell); i2=index_cells(2,icell); i3=index_cells(3,icell)
+    ia1 = 0 ; ib1 = 0
+!   Loop over coefficients
+    do icoeff=1,ncoeff
+!     Set the value of the coefficient
+      coeff = coefficients(icoeff)%coefficient
+!     Loop over terms of this coefficient
+      do iterm=1,coefficients(icoeff)%nterm
+!       Set the weight of this term
+        weight =coefficients(icoeff)%terms(iterm)%weight
+        tmp1 = one
+        ndisp = coefficients(icoeff)%terms(iterm)%ndisp
+        nstrain = coefficients(icoeff)%terms(iterm)%nstrain
+        ndisp_tot = ndisp + nstrain
+!       Loop over displacement and strain
+        do idisp1=1,ndisp_tot
+!         Set to one the acculation of forces and strain
+          tmp2 = one
+          tmp3 = zero
+
+!         Strain case idisp > ndisp
+          if (idisp1 > ndisp)then
+            tmp3 = one
+!           Set the power_strain of the strain:
+            idisp1_strain = idisp1 - ndisp
+            power_strain = coefficients(icoeff)%terms(iterm)%power_strain(idisp1_strain)
+!           Get the direction of the displacement or strain
+            idir1 = coefficients(icoeff)%terms(iterm)%strain(idisp1_strain)
+            if(abs(strain(idir1)) > tol10)then
+!             Accumulate energy fo each displacement (\sum ((A_x-O_x)^Y(A_y-O_c)^Z))
+              tmp1 = tmp1 * (strain(idir1))**power_strain
+              if(power_strain > 1) then
+!               Accumulate stress for each strain (\sum (Y(eta_2)^Y-1(eta_2)^Z+...))
+                tmp3 = tmp3 *  power_strain*(strain(idir1))**(power_strain-1)
+              end if
+            else
+              tmp1 = zero
+              if(power_strain > 1) then
+                tmp3 = zero
+              end if
+            end if
+          else
+!           Set the power_disp of the displacement:
+            power_disp = coefficients(icoeff)%terms(iterm)%power_disp(idisp1)
+!           Get the direction of the displacement or strain
+            idir1 = coefficients(icoeff)%terms(iterm)%direction(idisp1)
+!           Displacement case idir = 1, 2  or 3
+!           indexes of the cell of the atom a
+            cell_atoma1 = coefficients(icoeff)%terms(iterm)%cell(:,1,idisp1)
+            if(cell_atoma1(1)/=0.or.cell_atoma1(2)/=0.or.cell_atoma1(3)/=0) then
+!             if the cell is not 0 0 0 we apply PBC:
+              cell_atoma1(1) =  i1 + cell_atoma1(1)
+              cell_atoma1(2) =  i2 + cell_atoma1(2)
+              cell_atoma1(3) =  i3 + cell_atoma1(3)
+              call getPBCIndexes_supercell(cell_atoma1(1:3),sc_size(1:3))
+!             index of the first atom (position in the supercell if the cell is not 0 0 0)
+              ia1 = (cell_atoma1(1)-1)*sc_size(2)*sc_size(3)*natom_uc+&
+&                   (cell_atoma1(2)-1)*sc_size(3)*natom_uc+&
+&                   (cell_atoma1(3)-1)*natom_uc+&
+&                   coefficients(icoeff)%terms(iterm)%atindx(1,idisp1)
+            else
+!             index of the first atom (position in the supercell if the cell is 0 0 0)
+              ia1 = ii + coefficients(icoeff)%terms(iterm)%atindx(1,idisp1)
+            end if
+
+!           indexes of the cell of the atom b  (with PBC) same as ia1
+            cell_atomb1 = coefficients(icoeff)%terms(iterm)%cell(:,2,idisp1)
+            if(cell_atomb1(1)/=0.or.cell_atomb1(2)/=0.or.cell_atomb1(3)/=0) then
+              cell_atomb1(1) =  i1 + cell_atomb1(1)
+              cell_atomb1(2) =  i2 + cell_atomb1(2)
+              cell_atomb1(3) =  i3 + cell_atomb1(3)
+              call getPBCIndexes_supercell(cell_atomb1(1:3),sc_size(1:3))
+
+!             index of the second atom in the (position in the supercell  if the cell is not 0 0 0)
+              ib1 = (cell_atomb1(1)-1)*sc_size(2)*sc_size(3)*natom_uc+&
+&                   (cell_atomb1(2)-1)*sc_size(3)*natom_uc+&
+&                   (cell_atomb1(3)-1)*natom_uc+&
+&                   coefficients(icoeff)%terms(iterm)%atindx(2,idisp1)
+            else
+!             index of the first atom (position in the supercell if the cell is 0 0 0)
+              ib1 = ii + coefficients(icoeff)%terms(iterm)%atindx(2,idisp1)
+            end if
+
+!           Get the displacement for the both atoms
+            disp1 = disp(idir1,ia1)
+            disp2 = disp(idir1,ib1)
+
+            if(abs(disp1) > tol10 .or. abs(disp2)> tol10)then
+!           Accumulate energy fo each displacement (\sum ((A_x-O_x)^Y(A_y-O_c)^Z))
+              tmp1 = tmp1 * (disp1-disp2)**power_disp
+              if(power_disp > 1) then
+!               Accumulate forces for each displacement (\sum (Y(A_x-O_x)^Y-1(A_y-O_c)^Z+...))
+                tmp2 = tmp2 * power_disp*(disp1-disp2)**(power_disp-1)
+              end if
+            else
+              tmp1 = zero
+              if(power_disp > 1) then
+                tmp2 = zero
+              end if
+            end if
+          end if
+
+          do idisp2=1,ndisp_tot
+
+            if(idisp2 /= idisp1) then
+              if (idisp2 > ndisp)then
+                idisp2_strain = idisp2 - ndisp
+                idir2 = coefficients(icoeff)%terms(iterm)%strain(idisp2_strain)
+!               Strain case
+!               Set the power_strain of the strain:
+                power_strain = coefficients(icoeff)%terms(iterm)%power_strain(idisp2_strain)
+!               Accumulate energy forces
+                tmp2 = tmp2 * (strain(idir2))**power_strain
+!               Accumulate stress for each strain (\sum (Y(eta_2)^Y-1(eta_2)^Z+...))
+                tmp3 = tmp3 * (strain(idir2))**power_strain
+              else
+                idir2 = coefficients(icoeff)%terms(iterm)%direction(idisp2)
+                cell_atoma2=coefficients(icoeff)%terms(iterm)%cell(:,1,idisp2)
+                if(cell_atoma2(1)/=0.or.cell_atoma2(2)/=0.or.cell_atoma2(3)/=0) then
+                  cell_atoma2(1) =  i1 + cell_atoma2(1)
+                  cell_atoma2(2) =  i2 + cell_atoma2(2)
+                  cell_atoma2(3) =  i3 + cell_atoma2(3)
+                  call getPBCIndexes_supercell(cell_atoma2(1:3),sc_size(1:3))
+!                 index of the first atom (position in the supercell and direction)
+!                 if the cell of the atom a is not 0 0 0 (may happen)
+                  ia2 = (cell_atoma2(1)-1)*sc_size(2)*sc_size(3)*natom_uc+&
+&                       (cell_atoma2(2)-1)*sc_size(3)*natom_uc+&
+&                       (cell_atoma2(3)-1)*natom_uc+&
+&                       coefficients(icoeff)%terms(iterm)%atindx(1,idisp2)
+                else
+!                 index of the first atom (position in the supercell and direction)
+                  ia2 = ii + coefficients(icoeff)%terms(iterm)%atindx(1,idisp2)
+                end if
+
+                cell_atomb2= coefficients(icoeff)%terms(iterm)%cell(:,2,idisp2)
+
+                if(cell_atomb2(1)/=0.or.cell_atomb2(2)/=0.or.cell_atomb2(3)/=0) then
+!                 indexes of the cell2 (with PBC)
+                  cell_atomb2(1) =  i1 + cell_atomb2(1)
+                  cell_atomb2(2) =  i2 + cell_atomb2(2)
+                  cell_atomb2(3) =  i3 + cell_atomb2(3)
+                  call getPBCIndexes_supercell(cell_atomb2(1:3),sc_size(1:3))
+
+!                 index of the second atom in the (position in the supercell)
+                  ib2 = (cell_atomb2(1)-1)*sc_size(2)*sc_size(3)*natom_uc+&
+&                       (cell_atomb2(2)-1)*sc_size(3)*natom_uc+&
+&                       (cell_atomb2(3)-1)*natom_uc+&
+&                       coefficients(icoeff)%terms(iterm)%atindx(2,idisp2)
+                else
+                  ib2 = ii + coefficients(icoeff)%terms(iterm)%atindx(2,idisp2)
+                end if
+
+                disp1 = disp(idir2,ia2)
+                disp2 = disp(idir2,ib2)
+
+!               Set the power_disp of the displacement:
+                power_disp = coefficients(icoeff)%terms(iterm)%power_disp(idisp2)
+                tmp2 = tmp2 * (disp1-disp2)**power_disp
+                tmp3 = tmp3 * (disp1-disp2)**power_disp
+
+              end if
+            end if
+          end do
+
+          if(idisp1 > ndisp)then
+!           Accumule stress tensor
+            strten(idir1) = strten(idir1) + coeff * weight * tmp3
+          else
+!           Accumule  forces
+            fcart(idir1,ia1) =  fcart(idir1,ia1)  + coeff * weight * tmp2
+            fcart(idir1,ib1) =  fcart(idir1,ib1)  - coeff * weight * tmp2
+          end if
+        end do
+
+        energy_coeff(icoeff) = energy_coeff(icoeff) + coeff * weight * tmp1
+!       accumule energy
+        energy = energy +  coeff * weight * tmp1
+
+      end do
+    end do
+  end do
+
+
+! MPI_SUM
+  call xmpi_sum(energy, comm, ierr)
+  call xmpi_sum(fcart , comm, ierr)
+  call xmpi_sum(strten , comm, ierr)
+
+!Write to anharmonic_energy_terms.out ORIGINAL
+  INQUIRE(FILE=name_file,OPENED=file_opened,number=unit_out)
+  if(file_opened .eqv. .TRUE.)then
+    do icoeff=1,ncoeff
+      call xmpi_sum(energy_coeff(icoeff), comm, ierr)
+     ! Marcus write energy contributions of anharmonic terms to file
+      if(icoeff <ncoeff)then
+        write(unit_out,'(A,1ES24.16)',advance='no')  '    ',energy_coeff(icoeff)
+      else if(icoeff==ncoeff)then
+        write(unit_out,'(A,1ES24.16)',advance='yes') '    ',energy_coeff(icoeff)
+      end if
+    enddo
+  end if
+
+
+end subroutine polynomial_coeff_evaluate
+!!***
+
+function get_crystal_cutoff(crystal) result(cutoff)
+  type(crystal_t), intent(inout) :: crystal
+  real(dp) :: cutoff
+  integer :: ii
+  ! XXX: hexu: why cutoff + sum of axis lengths?
+  cutoff=0.1
+  do ii=1,3
+    cutoff = cutoff + sqrt(crystal%rprimd(ii,1)**2 + &
+      &                            crystal%rprimd(ii,2)**2 + &
+      &                            crystal%rprimd(ii,3)**2)
+  enddo
+end function get_crystal_cutoff
+
+subroutine prepare_for_getList(crystal,sc_size, dist,  cell, natom, nsym, nrpt, range_ifc, symbols )
+  type(crystal_t), intent(inout) :: crystal
+  integer, intent(in) :: sc_size(3)
+  integer, intent(inout) :: natom, nsym, nrpt
+  integer, allocatable, intent(inout) :: cell(:, :)
+  character(len=5),allocatable, intent(inout) :: symbols(:)
+
+  real(dp), allocatable:: xcart(:, :), xred(:,:),  rpt(:, :)
+  real(dp), allocatable:: dist(:, :, :, :)
+  real(dp) ::  rprimd(3,3), range_ifc(3)
+  integer :: ii, ncell(3), lim1, lim2, lim3
+  real(dp) :: norm
+  integer :: irpt, irpt_ref, r1, r2, r3, ia, ib
+
+ natom  = crystal%natom
+ nsym   = crystal%nsym
+ rprimd = crystal%rprimd
+
+ ABI_MALLOC(xcart,(3,natom))
+ ABI_MALLOC(xred,(3,natom))
+ xcart(:,:) = crystal%xcart(:,:)
+ xred(:,:)  = crystal%xred(:,:)
+
+!Compute the max range of the ifc with respect to the trainning set
+ range_ifc(:) = zero
+ do ii=1,3
+   norm = sqrt(rprimd(ii,1)**2+ rprimd(ii,2)**2+rprimd(ii,3)**2)
+   range_ifc(ii) = range_ifc(ii) + norm * sc_size(ii) / 2.0
+ end do
+
+
+!compute new ncell
+ ncell = sc_size
+ lim1=((ncell(1)/2)) + 1
+ lim2=((ncell(2)/2)) + 1
+ lim3=((ncell(3)/2)) + 1
+ if(mod(ncell(1),2)/=0) lim1=lim1+1
+ if(mod(ncell(2),2)/=0) lim2=lim2+1
+ if(mod(ncell(3),2)/=0) lim3=lim3+1
+ nrpt=(2*lim1+1)*(2*lim2+1)*(2*lim3+1)
+
+ ncell(1) = 2*lim1+1
+ ncell(2) = 2*lim2+1
+ ncell(3) = 2*lim3+1
+
+ !Build the rpt point
+ ABI_MALLOC(rpt,(3,nrpt))
+ ABI_MALLOC(cell,(3,nrpt))
+
+!WARNING:
+!Put the reference cell into the first element
+!the code will first deal with the atoms of the first cell
+ irpt = 1
+ irpt_ref = 1
+ rpt(:,1) = zero
+ cell(:,irpt)=0
+!Fill other rpt:
+ do r1=lim1,-lim1,-1
+   do r2=lim2,-lim2,-1
+     do r3=lim3,-lim3,-1
+       if(r1==0.and.r2==0.and.r3==0) then
+         cycle
+       end if
+       irpt=irpt+1
+       rpt(1,irpt)=r1*rprimd(1,1)+r2*rprimd(1,2)+r3*rprimd(1,3)
+       rpt(2,irpt)=r1*rprimd(2,1)+r2*rprimd(2,2)+r3*rprimd(2,3)
+       rpt(3,irpt)=r1*rprimd(3,1)+r2*rprimd(3,2)+r3*rprimd(3,3)
+       cell(1,irpt)=r1;cell(2,irpt)=r2;cell(3,irpt)=r3
+     end do
+   end do
+ end do
+
+ if (.not.(allocated(symbols)))  then
+    ABI_MALLOC(symbols,(natom))
+ endif
+ call symbols_crystal(crystal%natom,crystal%ntypat,crystal%npsp,&
+&                     symbols,crystal%typat,crystal%znucl)
+
+!Compute the distances between atoms
+!Now dist(3,ia,ib,irpt) contains the distance from atom ia to atom ib in unit cell irpt.
+ ABI_MALLOC(dist,(3,natom,natom,nrpt))
+ dist = zero
+ do ia=1,natom
+   do ib=1,natom
+     do irpt=1,nrpt
+       dist(1,ia,ib,irpt) = xcart(1,ib)-xcart(1,ia)+rpt(1,irpt)
+       dist(2,ia,ib,irpt) = xcart(2,ib)-xcart(2,ia)+rpt(2,irpt)
+       dist(3,ia,ib,irpt) = xcart(3,ib)-xcart(3,ia)+rpt(3,irpt)
+     end do
+   end do
+ end do
+
+   !call polynomial_coeff_getList(cell,crystal,dist,list_symcoeff,list_symstr,&
+   !  &                              natom,nstr_sym,ncoeff_sym,nrpt,range_ifc,cutoff,sc_size=sc_size,&
+   !  &                              fit_iatom=fit_iatom_in)
+ ABI_FREE(xcart)
+ ABI_FREE(xred)
+ ABI_FREE(rpt)
+end subroutine prepare_for_getList
+
+!!****f* m_polynomial_coeff/polynomial_coeff_getList
+!!
+!! NAME
+!! polynomial_coeff_getList
+!!
+!! FUNCTION
+!! Get the list of all  the possible coefficients for the polynome
+!!
+!! INPUTS
+!! cell(3,nrpt) = indexes of the cells into the supercell (-1 -1 -1, 0 0 0 ...)
+!! dist(3,natom,natom,nrpt) = distance between atoms atm1 is in the cell 0 0 0
+!!                                                   atm2 is in the nrpt cell (see cell(3,nrpt))
+!!                            for each component x,y and z
+!! crystal<type(crystal_t)> = datatype with all the information for the crystal
+!! natom = number of atoms in the unit cell
+!! nrpt  = number of cell in the supercell
+!!
+!! OUTPUT
+!! list_symcoeff(6,ncoeff_sym,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! list_symstr(nstr_sym,nsym) = array with the list of the strain  and the symmetrics
+!! nstr_sym = number of coefficient for the strain
+!! ncoeff_sym = number of coefficient for the IFC
+!! range_ifc(3) = maximum cut-off for the inter atomic forces constants in each direction
+!! sc_size(3) = optional,size of the supercell used for the fit.
+!!               For example if you want to fit 2x2x2 cell the interation
+!!               Sr-Ti and Sr-Ti[2 0 0] will be identical for the fit process
+!!               If check_pbc is true we remove these kind of terms
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_getList(cell,crystal,dist,list_symcoeff,list_symstr,&
+&                                   natom,nstr_sym,ncoeff_sym,nrpt,range_ifc,cutoff,sc_size,&
+&                                   fit_iatom)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ integer,intent(in) :: natom,nrpt
+ real(dp), intent(in)   :: cutoff
+ integer,intent(out) :: ncoeff_sym,nstr_sym
+ integer,optional,intent(in):: fit_iatom
+!arrays
+ integer,intent(in) :: cell(3,nrpt)
+ real(dp),intent(in):: dist(3,natom,natom,nrpt)
+ type(crystal_t), intent(in) :: crystal
+ integer,allocatable,intent(out) :: list_symcoeff(:,:,:),list_symstr(:,:,:)
+ integer,optional,intent(in) :: sc_size(3)
+ real(dp),intent(in):: range_ifc(3)
+!Local variables-------------------------------
+!scalar
+ integer :: ia,ib,icoeff,icoeff2,icoeff_tot,icoeff_tmp,idisy1,idisy2,ii
+ integer :: ipesy1,ipesy2,isym,irpt,irpt3,irpt_ref,irpt_sym
+ integer :: jj,jsym,mu,fit_iatom_in
+ integer :: ncoeff,ncoeff2,ncoeff3,ncoeff_max,nu
+ integer :: nsym,shift_atm1(3)
+ integer :: shift_atm2(3)
+ real(dp):: dist_orig,dist_sym,tolsym8
+ logical :: found,check_pbc,possible
+!arrays
+ integer :: isym_rec(3,3),isym_rel(3,3),sc_size_in(3)
+ integer :: transl(3),min_range(3),max_range(3)
+ integer,allocatable :: blkval(:,:,:,:,:),list(:),list_symcoeff_tmp(:,:,:),list_symcoeff_tmp2(:,:,:)
+ integer,allocatable :: list_symstr_tmp(:,:,:),indsym(:,:,:) ,symrec(:,:,:),symrel(:,:,:),list_symcoeff_tmp3(:,:,:)
+ integer,allocatable :: index_irred(:)
+ real(dp),allocatable :: tnons(:,:)
+ real(dp),allocatable :: wkdist(:),distance(:,:,:)
+ real(dp) :: difmin(3)
+ real(dp) :: rprimd(3,3)
+ real(dp) :: tratom(3)
+ character(len=500) :: message
+
+
+
+!Initialisation of variables
+ irpt_sym = 0
+ nsym   = crystal%nsym
+ rprimd = crystal%rprimd
+ !ABI_MALLOC(xcart,(3,natom))
+ !ABI_MALLOC(xred,(3,natom))
+ !xcart(:,:) = crystal%xcart(:,:)
+ !xred(:,:)  = crystal%xred(:,:)
+ ncoeff_max = nrpt*natom*natom*3*3
+
+!Found the ref cell
+ irpt_ref = 1
+ do irpt=1,nrpt
+   if(all(cell(:,irpt)==0))then
+     irpt_ref = irpt
+!     exit
+   end if
+ end do
+
+ !Set the size of the interaction
+ check_pbc = .FALSE.
+ sc_size_in = 0
+ min_range = 0; max_range = 0
+ if(present(sc_size))then
+   sc_size_in = sc_size
+   do mu=1,3
+     call findBound_supercell(min_range(mu),max_range(mu),sc_size_in(mu))
+   end do
+ end if
+
+ !Check which atom to fit, if not present do all atoms
+ if(present(fit_iatom))then
+    fit_iatom_in = fit_iatom
+ else
+    fit_iatom_in = -1
+ endif
+ if(fit_iatom_in > natom)then
+      write(message, '(3a)' )&
+&       'fit_iatom cannot be greater than the number of atoms on the reference unit cell',ch10,&
+&       'Action: Change input'
+   ABI_ERROR(message)
+ end if
+
+!Obtain a list of rotated atom labels:
+ ABI_MALLOC(indsym,(4,nsym,natom))
+ ABI_MALLOC(symrec,(3,3,nsym))
+ ABI_MALLOC(symrel,(3,3,nsym))
+ ABI_MALLOC(tnons,(3,nsym))
+ symrec = crystal%symrec
+ symrel = crystal%symrel
+ tnons  = crystal%tnons
+
+ tolsym8=tol13
+ call symatm(indsym,natom,nsym,symrec,tnons,&
+&            tolsym8,crystal%typat,crystal%xred)
+ ABI_MALLOC(blkval,(3,natom,3,natom,nrpt))
+ ABI_MALLOC(list,(natom*nrpt))
+ ABI_MALLOC(list_symcoeff_tmp,(5,ncoeff_max,nsym))
+ ABI_MALLOC(wkdist,(natom*nrpt))
+
+!1-Fill strain list
+ ABI_MALLOC(list_symstr_tmp,(6,nsym,2))
+ list_symstr_tmp = 1
+ do ia=1,6
+   if(list_symstr_tmp(ia,1,1)==0)cycle
+!  Transform the voigt notation
+   if(ia<=3)then
+     mu=ia;nu=ia
+   else
+     select case(ia)
+     case(4)
+       mu=2;nu=3
+     case(5)
+       mu=1;nu=3
+     case(6)
+       mu=1;nu=2
+     end select
+   end if
+   do isym=1,nsym
+!    Get the symmetry matrix
+     isym_rel(:,:) = crystal%symrel(:,:,isym)
+     do idisy1=1,3
+       do idisy2=1,3
+         if((isym_rel(mu,idisy1)/=0.and.isym_rel(nu,idisy2)/=0)) then
+!          Transform to the voig notation
+           if(idisy1==idisy2)then
+             list_symstr_tmp(ia,isym,1) = idisy1
+             list_symstr_tmp(ia,isym,2) = isym_rel(mu,idisy1)
+           else
+             if(idisy1==1.or.idisy2==1)then
+               if(idisy1==2.or.idisy2==2)then
+                 list_symstr_tmp(ia,isym,1) = 6
+               end if
+               if(idisy1==3.or.idisy2==3)then
+                 list_symstr_tmp(ia,isym,1) = 5
+               end if
+             else
+               list_symstr_tmp(ia,isym,1) = 4
+             end if
+           end if
+           list_symstr_tmp(ia,isym,2) = isym_rel(mu,idisy1) * isym_rel(nu,idisy2)
+         end if
+       end do
+     end do
+!    Remove the symetric
+!     if(list_symstr_tmp(ia,isym,1) > ia) then
+!       list_symstr_tmp(list_symstr_tmp(ia,isym,1),:,1) = 0
+!     end if
+   end do
+ end do
+
+!Count the number of strain and transfert into the final array
+  nstr_sym = 0
+  do ia=1,6
+    if(list_symstr_tmp(ia,1,1)/=0) nstr_sym = nstr_sym + 1
+  end do
+
+ if(allocated(list_symstr))then
+   ABI_FREE(list_symstr)
+ end if
+ ABI_MALLOC(list_symstr,(nstr_sym,nsym,2))
+
+ icoeff_tmp = 1
+ do ia=1,6
+   if(list_symstr_tmp(ia,1,1)/=0) then
+     list_symstr(icoeff_tmp,:,:) = list_symstr_tmp(ia,:,:)
+     icoeff_tmp = icoeff_tmp + 1
+   end if
+ end do
+!END STRAIN
+
+!Compute the distance between each atoms. Indeed the dist array contains the difference of
+!cartesian coordinate for each direction
+! dist: vector between atom a, (0,0,0) and atom b (rpt)
+
+ ABI_MALLOC(distance,(natom,natom,nrpt))
+ ! Fortran 2008:  distance = norm2(dist, dim=1)
+ do ia=1,natom
+   do ib=1,natom
+     do irpt=1,nrpt
+       distance(ia,ib,irpt) = ((dist(1,ia,ib,irpt))**2+(dist(2,ia,ib,irpt))**2+&
+&                              (dist(3,ia,ib,irpt))**2)**0.5
+     end do
+   end do
+ end do
+
+
+!Set to one blkval, all the coeff have to be compute
+ blkval = 1
+ icoeff = 1
+ icoeff_tot = 1
+ list_symcoeff_tmp = 0
+
+!2-Fill atom list
+!Big loop over generic atom
+ do ia=1,natom
+   wkdist(:)=reshape(distance(ia,:,:),(/natom*nrpt/))
+   do ii=1,natom*nrpt
+     list(ii)=ii
+   end do
+   ! FIXME: hexu: I think this should be improved.
+   ! It seems that it depends on the specific order of the
+   ! cell, and the implementation of sort algorithm.
+   ! The sort should preserve the order if two distances are the same.
+   ! In the future, the order of the cell might need to be unified
+   ! Also it seems to depend on the cubic cell.
+   call sort_dp(natom*nrpt,wkdist,list,tol8)
+   do ii=1,natom*nrpt
+!    Get the irpt and ib
+     irpt=(list(ii)-1)/natom+1
+     ib=list(ii)-natom*(irpt-1)
+     possible = .true.
+!Old way with the cut off
+     if(cutoff < distance(ia,ib,irpt))then
+       possible = .false.
+     else
+       ! in each direction jj, the d component d(jj) should be smaller than range_ifc(jj)
+       do jj=1,3
+!          if(abs(dist(jj,ia,ib,irpt)) - range_ifc(jj)  > tol10.or.&
+! &            abs(abs(dist(jj,ia,ib,irpt)) - range_ifc(jj))  < tol10)then
+          if(abs(dist(jj,ia,ib,irpt)) - range_ifc(jj)  > tol10)then
+         possible = .false.
+         end if
+       end do
+    endif
+
+!    If this distance is superior to the cutoff, we don't compute that term
+     if(.not.possible)then
+       blkval(:,ia,:,ib,irpt)= 0
+       ! remove duplication: if in reference cell, only consider ab, not ba.
+       if(irpt==irpt_ref)blkval(:,ib,:,ia,irpt)= 0
+!        Stop the loop
+       cycle
+     end if
+
+!    If this coefficient is not possible, we cycle...
+     if (all(blkval(:,ia,:,ib,irpt)==0)) cycle
+
+!    Save the distance between the two atoms for futur checks
+     dist_orig = (dist(1,ia,ib,irpt)**2+dist(2,ia,ib,irpt)**2+dist(3,ia,ib,irpt)**2)**0.5
+
+     do mu=1,3
+       do nu=1,3
+!      Check if : - The coefficient is not yet compute
+!                 - The directions are the same
+!                 - The atoms are not equivalent
+         if (mu/=nu) then
+           blkval(mu,ia,nu,ib,irpt)=0
+           blkval(nu,ia,mu,ib,irpt)=0
+           cycle
+         end if
+!        Pass if the atoms are identical and in the ref cell
+         if(irpt==irpt_ref.and.ia==ib) then
+           blkval(mu,ia,nu,ib,irpt)=0
+           blkval(nu,ib,mu,ia,irpt)=0
+           cycle
+         end if
+         if(blkval(mu,ia,nu,ib,irpt)==1)then
+!          Loop over symmetries
+           do isym=1,nsym
+!            Get the symmetry matrix for this sym
+             isym_rec(:,:)  = crystal%symrec(:,:,isym)
+             isym_rel(:,:) = crystal%symrel(:,:,isym)
+!            Get the corresponding atom and shift with the symetries
+!            For atom 1
+             ipesy1 = indsym(4,isym,ia)
+             shift_atm1 = indsym(1:3,isym,ia)
+!            And atom 2
+             do jj=1,3 ! Apply transformation to original coordinates.
+               tratom(jj) = dble(isym_rec(1,jj))*(crystal%xred(1,ib)+cell(1,irpt)-tnons(1,isym))&
+                 &         +dble(isym_rec(2,jj))*(crystal%xred(2,ib)+cell(2,irpt)-tnons(2,isym))&
+                 &         +dble(isym_rec(3,jj))*(crystal%xred(3,ib)+cell(3,irpt)-tnons(3,isym))
+
+             end do
+
+!            Find symmetrically equivalent atom
+             call symchk(difmin,ipesy2,natom,tratom,transl,crystal%typat(ib),&
+&                        crystal%typat,crystal%xred(:,:))
+
+!            Put information into array indsym: translations and label
+             shift_atm2(:)= transl(:) - shift_atm1(:)
+             found = .false.
+             do irpt3=1,nrpt
+               if(cell(1,irpt3)==shift_atm2(1).and.&
+&                 cell(2,irpt3)==shift_atm2(2).and.&
+&                 cell(3,irpt3)==shift_atm2(3))then
+                 found = .true.
+                 irpt_sym = irpt3
+               end if
+             end do
+
+!            Check the distance
+             dist_sym = (dist(1,ipesy1,ipesy2,irpt_sym)**2+&
+&                        dist(2,ipesy1,ipesy2,irpt_sym)**2+&
+&                        dist(3,ipesy1,ipesy2,irpt_sym)**2)**0.5
+             if(abs(dist_orig - dist_sym) > tol10)then
+               write(message, '(a,i0,2a,I0,a,es15.8,2a,es15.8,2a)' )&
+&                'The distance between the atoms for the coefficient number ',icoeff,ch10,&
+&                'with the symmetry ',isym,' is ',dist_sym,ch10,'but the original distance is',&
+&                   dist_orig,ch10,&
+&                'Action: Contact abinit group'
+               ABI_BUG(message)
+             end if
+!            Now that a symmetric perturbation has been obtained,
+!            including the expression of the symmetry matrix, see
+!            if the symmetric perturbations are available
+             do idisy1=1,3
+               do idisy2=1,3
+                 if (idisy1/=idisy2) then
+!                  Remove this term (is not computed)
+!                  Also remove opposite term... (Srx-Tix) = (Tix-Srx)
+                   blkval(idisy1,ipesy1,idisy2,ipesy2,irpt_sym) = 0
+                   blkval(idisy2,ipesy1,idisy1,ipesy2,irpt_sym) = 0
+                   cycle
+                 else
+                   if(isym_rel(mu,idisy1)/=0.and.isym_rel(nu,idisy2)/=0)then
+                     if(.not.found.or.(irpt_sym==irpt_ref.and.ipesy1==ipesy2)) then
+!                      Remove this term (is not computed) Sr-Sr or not include in the cell
+!                      Also remove oposite term... (Srx-Tix) = (Ti-Srx)
+                       blkval(idisy1,ipesy1,idisy2,ipesy2,irpt_sym) = 0
+                       blkval(idisy2,ipesy2,idisy1,ipesy1,irpt_sym) = 0
+                       cycle
+                     else
+!                      Fill the list with the coeff and symmetric (need all symmetrics)
+                       list_symcoeff_tmp(1:4,icoeff,isym)=(/idisy1,ipesy1,ipesy2,irpt_sym/)
+!                      Check the sign
+                       if(isym_rel(mu,idisy1)/=isym_rel(nu,idisy2))then
+                         write(message, '(a,i0,a,I0,4a)' )&
+&                        'The sign of coefficient number ',icoeff,' with the symmetry ',isym,ch10,&
+&                        'can not be found... Something is going wrong',ch10,&
+&                        'Action: Contact abinit group'
+                         ABI_BUG(message)
+                       end if
+                       list_symcoeff_tmp(5,icoeff,isym)= isym_rel(nu,idisy2)
+                     end if
+                   end if
+                 end if
+               end do
+             end do
+           end do ! end loop sym
+           icoeff = icoeff + 1
+         end if
+!        This coeff is now computed
+         blkval(mu,ia,nu,ib,irpt)= 0
+       end do ! end loop nu
+     end do ! end loop mu
+   end do ! end loop ii: iatom and irpt.
+ end do ! end loop ia
+
+!Reset the output
+ if(allocated(list_symcoeff))then
+   ABI_FREE(list_symcoeff)
+ end if
+
+ ABI_FREE(distance)
+
+!Transfert the final array with all the coefficients
+!With this array, we can access to all the terms presents
+!ncoeff1 + symetrics
+!first dimension is 4 (mu,ia,ib,irpt)
+!irpt is the index of the cell of the atom ib in the cell array
+!example cell(:,irpt=12) can be (-1 0 -2). The cell of ia is
+!always 0 0 0
+!Transfert the final array for the list of irreductible coeff and symetries
+!With this array, we can access to the irretuctible coefficients (ncoeff1) and
+!all the symetrics of these coefficients (nsym)
+!first dimension is 5 (mu,ia,ib,irpt,icoeff)
+!icoeff is the position of this coefficients in the list_fullcoeff array
+
+!1/ step remove the zero coeff in this array
+ ncoeff = 0
+ do icoeff = 1,ncoeff_max
+     if(.not.(all(list_symcoeff_tmp(:,icoeff,1)==0)))then
+     ncoeff = ncoeff + 1
+   end if
+ end do
+
+ ABI_MALLOC(list_symcoeff_tmp2,(6,ncoeff,nsym))
+ list_symcoeff_tmp2 = 0
+ icoeff = 0
+ do icoeff_tmp = 1,ncoeff_max
+   if(.not.(all(list_symcoeff_tmp(:,icoeff_tmp,1)==0)))then
+     icoeff = icoeff + 1
+     list_symcoeff_tmp2(1:5,icoeff,:) = list_symcoeff_tmp(1:5,icoeff_tmp,:)
+     end if
+ end do
+
+
+!2/ set the dimension six of list_symcoeff_tmp2(6,icoeffs,1)
+!   and check is a symetric coeff is not coresspondig to an other
+!   one, in this case we set this coeff to 0
+! ncoeff2 = zero
+ do icoeff = 1,ncoeff
+!  found the index of each coeff in list_fullcoeff
+   do isym = 1,nsym
+     icoeff2 = getCoeffFromList(list_symcoeff_tmp2(:,:,1),&
+&                               list_symcoeff_tmp2(2,icoeff,isym),&
+&                               list_symcoeff_tmp2(3,icoeff,isym),&
+&                               list_symcoeff_tmp2(4,icoeff,isym),&
+&                               list_symcoeff_tmp2(1,icoeff,isym),&
+&                               ncoeff)
+     list_symcoeff_tmp2(6,icoeff,isym) = icoeff2
+   end do
+ end do
+
+!2.5/do checks
+ do icoeff = 1,ncoeff
+   do isym = 1,nsym
+     if(list_symcoeff_tmp2(6,icoeff,isym)==0)then
+       write(message, '(a,i0,a,I0,4a)' )&
+&           'The coefficient number ',icoeff,' with the symetrie ',isym,ch10,&
+&           'has no equivalent',ch10,&
+&           'Action: Contact abinit group'
+       ABI_BUG(message)
+     else
+       if(icoeff /= list_symcoeff_tmp2(6,icoeff,isym))then
+         if(list_symcoeff_tmp2(1,icoeff,isym)/=&
+&           list_symcoeff_tmp2(1,list_symcoeff_tmp2(6,icoeff,isym),1))then
+           write(message, '(a,i0,a,I0,2a,I0,4a)' )&
+&          'The coefficient number ',icoeff,' with the symetrie ',isym,ch10,&
+&          'does not refer to the same coefficient ',list_symcoeff_tmp2(6,icoeff,1),ch10,&
+&          'because the direction is different:',ch10,&
+&          'Action: Contact abinit group'
+           ABI_BUG(message)
+         end if
+         if(list_symcoeff_tmp2(4,icoeff,isym)/=&
+&           list_symcoeff_tmp2(4,list_symcoeff_tmp2(6,icoeff,isym),1))then
+           write(message, '(a,i0,a,I0,2a,I0,4a)' )&
+&          'The coefficient number ',icoeff,' with the symetrie ',isym,ch10,&
+&          'does not refer to the same coefficient ',list_symcoeff_tmp2(6,icoeff,1),ch10,&
+&          'because the cell is different',ch10,&
+&          'Action: Contact abinit group'
+           ABI_BUG(message)
+         end if
+         if((list_symcoeff_tmp2(2,icoeff,isym)/=&
+&            list_symcoeff_tmp2(2,list_symcoeff_tmp2(6,icoeff,isym),1).and.&
+&            list_symcoeff_tmp2(3,icoeff,isym)/=&
+&            list_symcoeff_tmp2(3,list_symcoeff_tmp2(6,icoeff,isym),1)).and.&
+&           (list_symcoeff_tmp2(2,icoeff,isym)/=&
+&            list_symcoeff_tmp2(3,list_symcoeff_tmp2(6,icoeff,isym),1).and.&
+&            list_symcoeff_tmp2(3,icoeff,isym)/=&
+&            list_symcoeff_tmp2(2,list_symcoeff_tmp2(6,icoeff,isym),1)))then
+           write(message, '(a,i0,a,I0,2a,I0,4a)' )&
+&          'The coefficient number ',icoeff,' with the symetrie ',isym,ch10,&
+&          'does not refer to the same coefficient ',list_symcoeff_tmp2(6,icoeff,1),ch10,&
+&          'because the atoms different',ch10,&
+&          'Action: Contact abinit group'
+           ABI_BUG(message)
+         end if
+       end if
+     end if
+   end do
+ end do
+
+
+!Check if the atom 2 is not (with the PBC) is in the same cell than
+!the atom 1. For example if you want to fit 2x2x2 cell the interation
+!Sr-Ti and Sr-Ti[2 0 0] will be identical for the fit process...
+ do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0)))then
+     do mu=1,3
+       ! out of max_range(mu)
+       if( -max_range(mu) > cell(mu,list_symcoeff_tmp2(4,icoeff,1)) .or. &
+&           cell(mu,list_symcoeff_tmp2(4,icoeff,1)) > max_range(mu))then
+
+         ! FIXME: hexu: cell(mu, irpt). But why -1?
+         ! The if above looks sufficient.
+         !if(cell(mu,list_symcoeff_tmp2(4,icoeff,1)) < -1)then
+         list_symcoeff_tmp2(:,icoeff,:)=0
+         exit
+         !end if
+       end if
+     end do
+   end if
+ !MS only keep terms with ia == fit_iatom or ib == fit_iatom specified in input
+   if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0)) .and. fit_iatom_in > 0)then
+     if (list_symcoeff_tmp2(2,icoeff,1) /= fit_iatom_in) then !& LB
+!&        list_symcoeff_tmp2(3,icoeff,1) /= fit_iatom_in)then  LB
+         list_symcoeff_tmp2(:,icoeff,1) = 0
+!     else if(list_symcoeff_tmp2(2,icoeff,1) /= fit_iatom_in) then ! &
+!&            .and. list_symcoeff_tmp2(3,icoeff,1) == fit_iatom_in &  !LB
+!&            .and. any(cell(:,list_symcoeff_tmp2(4,icoeff,1)) /= 0))then !LB
+!         list_symcoeff_tmp2(:,icoeff,1) = 0
+     endif
+   endif
+!For Debugging keep only terms A_x-A_x[100] etc. comment if above
+!  if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0)))then
+!    if (list_symcoeff_tmp2(2,icoeff,1) /= 1 .or. list_symcoeff_tmp2(3,icoeff,1) /= 1)then
+!        list_symcoeff_tmp2(:,icoeff,1) = 0
+!    endif  !MS only keep terms with ia == 1
+!  endif
+end do
+
+!write(std_out,*) "DEBUG: min_range(:): ", min_range(:)
+!write(std_out,*) "DEBUG: max_range(:): ", max_range(:)
+
+!3/ Remove useless terms like opposites
+ do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0)) .and. & ! valid term.
+&      list_symcoeff_tmp2(2,icoeff,1) /= list_symcoeff_tmp2(3,icoeff,1))then ! on-site term. ! FIXME: hexu:I don't understand if iatom=jatom but rpt/=0, it is not onsite.
+   do isym = 1,nsym
+   !icoeff2 = list_symcoeff_tmp2(6,icoeff,isym)
+   !if (icoeff2> icoeff)then
+   !  list_symcoeff_tmp2(:,icoeff2,1) = 0
+   !end if
+     do jsym=1,nsym
+       ! FIXME: Should the rpt be -rpt??
+!       icoeff2 = getCoeffFromList(list_symcoeff_tmp2(:,:,jsym),&
+!&                                 list_symcoeff_tmp2(3,icoeff,isym),&
+!&                                 list_symcoeff_tmp2(2,icoeff,isym),&
+!&                                 list_symcoeff_tmp2(4,icoeff,isym),& !rpt
+!&                                 list_symcoeff_tmp2(1,icoeff,isym),&
+!&                                 ncoeff)
+       icoeff2 = getCoeffFromList(list_symcoeff_tmp2(:,:,jsym),&
+&                                 list_symcoeff_tmp2(3,icoeff,isym),&
+&                                 list_symcoeff_tmp2(2,icoeff,isym),&
+&                                 list_symcoeff_tmp2(4,icoeff,isym),& !rpt
+&                                 find_opposite_irpt(cell, list_symcoeff_tmp2(1,icoeff,isym)),&
+&                                 ncoeff)
+
+       if (icoeff2> icoeff)then
+         list_symcoeff_tmp2(:,icoeff2,1) = 0
+       end if
+     end do
+   end do
+   end if
+ end do
+
+!4/ Recount the number of coeff after step 3
+ ncoeff2 = 0
+ isym = 0
+ do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0)))then
+     ncoeff2 = ncoeff2 + 1
+   end if
+ end do
+
+!write(std_out,*) "DEBUG ncoeff after 2.5.3: ", ncoeff
+!write(std_out,*) "DEBUG ncoeff2 after 2.5.3: ", ncoeff2
+
+ ABI_FREE(list_symcoeff_tmp)
+ ABI_MALLOC(list_symcoeff_tmp,(6,ncoeff,nsym))
+ list_symcoeff_tmp = list_symcoeff_tmp2
+
+!4.1 Count irreducible terms
+ do icoeff = 1,ncoeff
+   do isym = 1,nsym
+     icoeff2 = list_symcoeff_tmp2(6,icoeff,isym)
+     if (icoeff2> icoeff)then
+       list_symcoeff_tmp(:,icoeff2,1) = 0
+     end if
+   end do
+ end do
+
+ncoeff3 = 0
+ do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp(:,icoeff,1)==0)))then
+     ncoeff3 = ncoeff3 + 1
+   end if
+ end do
+!write(std_out,*) "DEBUG ncoeff3 after 2.5.3: ", ncoeff3
+
+!4.2 Put irreducible terms in front of list_symcoeff_tmp3
+!    Store index of irreducible terms
+ ABI_MALLOC(list_symcoeff_tmp3,(6,ncoeff2,nsym))
+ ABI_MALLOC(index_irred,(ncoeff3))
+icoeff_tmp = 0
+do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp(:,icoeff,1)==0)))then
+     icoeff_tmp = icoeff_tmp+1
+     index_irred(icoeff_tmp) = icoeff
+     list_symcoeff_tmp3(:,icoeff_tmp,:) = list_symcoeff_tmp(:,icoeff,:)
+   endif
+enddo
+
+!4.3 Put symmetric equivalents behind in list_symcoeff_tmp3
+!    Attention icoeff_tmps keeps it's value of loop before
+!    TODO for check should be equal to ncoeff2
+do icoeff = 1,ncoeff
+   if(.not.(all(list_symcoeff_tmp2(:,icoeff,1)==0))&
+&     .and..not. any(index_irred == icoeff))then
+     icoeff_tmp = icoeff_tmp+1
+     list_symcoeff_tmp3(:,icoeff_tmp,:) = list_symcoeff_tmp2(:,icoeff,:)
+   endif
+enddo
+
+!4.4 A little copy round
+ABI_FREE(list_symcoeff_tmp)
+ ABI_MALLOC(list_symcoeff_tmp,(6,ncoeff2,nsym))
+list_symcoeff_tmp = list_symcoeff_tmp3
+
+!5/ Final transfert
+ ABI_MALLOC(list_symcoeff,(6,ncoeff2,nsym))
+ list_symcoeff = 0
+ icoeff = 0
+ do icoeff = 1,ncoeff2
+   list_symcoeff(1:6,icoeff,:) = list_symcoeff_tmp(1:6,icoeff,:)
+   do isym=1,nsym
+   end do
+ end do
+
+!6/ reset the dimension six of list_symcoeff_tmp2(6,icoeffs,1)
+!   and check is a symetric coeff is not coresspondig to an other
+!   one, in this case we set this coeff to 0
+ do icoeff = 1,ncoeff2
+!  found the index of each coeff in list_fullcoeff
+   do isym = 1,nsym
+     icoeff2 = getCoeffFromList(list_symcoeff(:,:,1),&
+&                               list_symcoeff(2,icoeff,isym),&
+&                               list_symcoeff(3,icoeff,isym),&
+&                               list_symcoeff(4,icoeff,isym),&
+&                               list_symcoeff(1,icoeff,isym),&
+&                               ncoeff2)
+     list_symcoeff(6,icoeff,isym) = icoeff2
+!     list_symcoeff(6,icoeff2,isym) = icoeff
+   end do
+ end do
+
+!Set the max number of coeff inside list_symcoeff
+ ncoeff_sym = ncoeff3
+
+
+!Deallocation
+ ABI_FREE(blkval)
+ ABI_FREE(list)
+ ABI_FREE(list_symcoeff_tmp)
+ ABI_FREE(list_symcoeff_tmp2)
+ ABI_FREE(list_symcoeff_tmp3)
+ ABI_FREE(list_symstr_tmp)
+ ABI_FREE(index_irred)
+ ABI_FREE(indsym)
+ ABI_FREE(symrec)
+ ABI_FREE(symrel)
+ ABI_FREE(tnons)
+ !ABI_FREE(xcart)
+ !ABI_FREE(xred )
+ ABI_FREE(wkdist)
+end subroutine polynomial_coeff_getList
+!!***
+
+
+!!****f* m_polynomial_coeff/polynomial_coeff_getNorder
+!!
+!! NAME
+!! polynomial_coeff_getNorder
+!!
+!! FUNCTION
+!! Compute and store into the datatype coefficients, all the possible
+!! coefficients for given orders
+!!
+!! INPUTS
+!! cutoff = cut-off for the inter atomic forces constants
+!! crystal<type(crystal_t)> = datatype with all the information for the crystal
+!! power_disps(2) = array with the minimal and maximal power_disp to be computed
+!! max_power_strain = maximum order of the strain of the strain phonon coupling
+!! option = 0 compute all terms
+!!          1 still in development
+!! sc_size(3) = size of the supercell used for the fit.
+!!               For example if you want to fit 2x2x2 cell the interation
+!!               Sr-Ti and Sr-Ti[2 0 0] will be identical for the fit process
+!!               If check_pbc is true we remove these kind of terms
+!! comm = MPI communicator
+!! anharmstr = logical, optional : TRUE, the anharmonic strain is computed (\eta)^power_disp ...
+!!                                   FALSE, (default) the anharmonic strain are not computed
+!! spcoupling= logical, optional : TRUE(default) the anharmonic strain-phonon coupling is computed
+!! only_odd_power = logical, optional : if TRUE return only odd power
+!! only_even_power= logical, optional : if TRUe return only even power
+!! distributed = logical, optional : True, the coefficients will be distributed on the CPU
+!! verbose  = optional, flag for the verbose mode
+!!
+!! OUTPUT
+!! polynomial_coeff<(type(polynomial_coeff_type)>(ncoeff) = array of datatype with the polynomial_coeff
+!! ncoeff = number of coefficients for this CPU if distributed == true, all otherwise
+!! ncoeff_tot = total number of coefficient over the CPU
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_getNorder(coefficients,crystal,cutoff,ncoeff,ncoeff_tot,power_disps,&
+&                                     max_power_strain,option,sc_size,comm,anharmstr,spcoupling,&
+&                                     distributed,only_odd_power,only_even_power,fit_iatom,&
+&                                     compute_symmetric,dispterms,verbose)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ integer,intent(in) :: max_power_strain,option,comm
+ integer,intent(out):: ncoeff,ncoeff_tot
+ integer,optional,intent(in) :: fit_iatom
+ real(dp),intent(in):: cutoff
+ logical,optional,intent(in) :: anharmstr,spcoupling,distributed,verbose,dispterms
+ logical,optional,intent(in) :: only_odd_power,only_even_power,compute_symmetric
+!arrays
+ integer,intent(in) :: power_disps(2),sc_size(3)
+ type(crystal_t), intent(inout) :: crystal
+ type(polynomial_coeff_type),allocatable,intent(inout) :: coefficients(:)
+!Local variables-------------------------------
+!scalar
+ integer :: icoeff,icoeff2,icoeff3,ierr,ii,iterm
+ integer :: i
+ integer :: master,my_rank,my_ncoeff,my_newncoeff,natom,ncombination,ncoeff_max,ncoeff_sym
+ integer :: ncoeff_symsym,nirred_comb,iirred_comb,ndisp,nstrain,fit_iatom_in
+ integer :: ncoeff_alone,ndisp_max,nproc,nrpt,nsym,nterm,nstr_sym,my_size
+ integer :: my_icoeff,rank_to_send,rank_to_receive,rank_to_send_save
+ integer :: ncombi_alone,my_ncombi_simple,my_ncombi_start,my_ncombi_end,my_ncombi,my_nirred
+ logical :: iam_master,need_anharmstr,need_spcoupling,need_distributed,need_verbose
+ logical :: need_only_odd_power,need_only_even_power,compute_sym,irreducible,need_compute_symmetric
+ logical :: need_dispterms
+!arrays
+ integer :: shape_listsymcoeff(3),shape_listsymstr(3)
+ integer,allocatable :: buffsize(:),buffdispl(:) !,dummylist(:) ,index_irred(:)
+ integer,allocatable :: offsets(:)
+ integer,allocatable :: cell(:,:),compatibleCoeffs(:,:)
+ integer,allocatable :: list_symcoeff(:,:,:),list_symstr(:,:,:),list_coeff(:),list_combination(:,:)
+ integer,allocatable :: list_combination_tmp(:,:)
+ integer,allocatable :: irank_ncombi(:),my_index_irredcomb(:)
+ integer,allocatable :: my_coefflist(:),my_coeffindexes(:),my_newcoeffindexes(:),my_list_combination(:,:)
+ type(int2d_array_type) :: my_array_combination
+ integer,allocatable :: my_list_combination_tmp(:,:)
+ real(dp) :: rprimd(3,3),range_ifc(3)
+ real(dp),allocatable :: dist(:,:,:,:)
+ character(len=5),allocatable :: symbols(:)
+ character(len=200):: name
+ character(len=500) :: message
+ type(polynomial_coeff_type),dimension(:),allocatable :: coeffs_tmp
+ type(polynomial_term_type),dimension(:),allocatable :: terms
+ character(len=fnlen) :: filename
+! *************************************************************************
+ !Hide filename for debugging
+ ABI_UNUSED(filename)
+
+ !MPI variables
+ master = 0
+ nproc = xmpi_comm_size(comm); my_rank = xmpi_comm_rank(comm)
+ iam_master = (my_rank == master)
+
+!Free the output
+ if(allocated(coefficients))then
+   do ii =1,size(coefficients)
+     call polynomial_coeff_free(coefficients(ii))
+   end do
+   ABI_FREE(coefficients)
+ end if
+
+!Check
+ if(option > power_disps(2))then
+   write(message, '(3a)' )&
+&       'Option can not be superior to the maximum order ',ch10,&
+&       'Action: contact abinit group'
+   ABI_ERROR(message)
+ end if
+
+!Initialisation of variables
+ need_anharmstr = .TRUE.
+ if(present(anharmstr)) need_anharmstr = anharmstr
+ need_spcoupling = .TRUE.
+ if(present(spcoupling)) need_spcoupling = spcoupling
+ need_distributed = .FALSE.
+ if(present(distributed)) need_distributed  = distributed
+ need_verbose = .TRUE.
+ if(present(verbose)) need_verbose = verbose
+ need_only_odd_power = .FALSE.
+ if(present(only_odd_power)) need_only_odd_power = only_odd_power
+ need_only_even_power = .FALSE.
+ if(present(only_even_power)) need_only_even_power = only_even_power
+ need_compute_symmetric = .TRUE.
+ if(present(compute_symmetric)) need_compute_symmetric = compute_symmetric
+ need_dispterms = .TRUE.
+ if(present(dispterms)) need_dispterms = dispterms
+
+ if(need_only_odd_power.and.need_only_even_power)then
+      write(message, '(3a)' )&
+&       'need_only_odd_power and need_only_even_power are both true',ch10,&
+&       'Action: contact abinit group'
+   ABI_ERROR(message)
+ end if
+
+ !Check which atom to fit, if not present do all atoms
+ if(present(fit_iatom))then
+   ! FIXME: the fit_iatom as the input is the index of the atom
+   ! but in the fitting subroutine, it is the irreducible atom.
+    fit_iatom_in = fit_iatom
+ else
+    fit_iatom_in = -1
+ endif
+
+  rprimd = crystal%rprimd
+
+ !=
+call prepare_for_getList(crystal,sc_size, dist, cell, natom, nsym, nrpt, range_ifc , symbols)
+
+if(iam_master)then
+ if(need_verbose)then
+   write(message,'(1a)')' Generation of the list of all the possible pairs of atoms within cutoff'
+   call wrtout(std_out,message,'COLL')
+ end if
+ call polynomial_coeff_getList(cell,crystal,dist,list_symcoeff,list_symstr,&
+&                              natom,nstr_sym,ncoeff_sym,nrpt,range_ifc,cutoff,sc_size=sc_size,&
+&                              fit_iatom=fit_iatom_in)
+
+
+ shape_listsymcoeff = shape(list_symcoeff)
+ shape_listsymstr   = shape(list_symstr)
+endif!if iam master
+
+!Broadcast Results of getList
+call xmpi_bcast(shape_listsymcoeff, master, comm, ierr)
+call xmpi_bcast(shape_listsymstr, master, comm, ierr)
+call xmpi_bcast(nstr_sym, master, comm, ierr)
+call xmpi_bcast(ncoeff_sym, master, comm, ierr)
+if(.not. iam_master )then
+  ABI_MALLOC(list_symcoeff,(shape_listsymcoeff(1),shape_listsymcoeff(2),shape_listsymcoeff(3)))
+  ABI_MALLOC(list_symstr,(shape_listsymstr(1),shape_listsymstr(2),shape_listsymstr(3)))
+endif
+call xmpi_bcast(list_symcoeff, master, comm, ierr)
+call xmpi_bcast(list_symstr, master, comm, ierr)
+call xmpi_barrier(comm)
+
+ncoeff_symsym = size(list_symcoeff(1,:,1))
+
+!Compute the total number of coefficient
+ ncoeff_tot = ncoeff_sym+nstr_sym
+
+!if(iam_master)then
+!Check the distanceance bewteen coefficients and store integer:
+! 0: the mix between these coefficient is not possible
+! 1: the mix between these coefficient is possible
+   ABI_MALLOC(compatibleCoeffs,(ncoeff_symsym+nstr_sym,ncoeff_symsym+nstr_sym))
+   compatibleCoeffs(:,:) = 1
+
+   if(need_verbose)then
+     write(message,'(1a)')' Check the compatible coefficients with respect to the cutoff'
+     call wrtout(std_out,message,'COLL')
+   end if
+
+   do icoeff=1,ncoeff_symsym+nstr_sym
+     do icoeff2=1,ncoeff_symsym+nstr_sym
+!      Select case:
+!      if both icoeff are displacement => check the distance
+!      if both icoeff are strain => check the flag
+!      Otherwise cycle (we keep the term)
+!       if(icoeff>ncoeff_sym.and.icoeff2<=ncoeff_sym)cycle
+!       if(icoeff<=ncoeff_sym.and.icoeff2>ncoeff_sym)cycle
+       !Forbid anharmonic strain terms if not wanted
+       if((icoeff>ncoeff_symsym .and. icoeff2>ncoeff_symsym).and.&
+&       .not.need_anharmstr) then
+         compatibleCoeffs(icoeff,icoeff2) = 0
+         compatibleCoeffs(icoeff2,icoeff) = 0
+       end if
+       !Forbid strain phonon terms if not wanted
+       if((icoeff>ncoeff_symsym.or.icoeff2>ncoeff_symsym).and.&
+&       .not.need_spcoupling) then
+         compatibleCoeffs(icoeff,icoeff2) = 0
+         compatibleCoeffs(icoeff2,icoeff) = 0
+       end if
+!!TEST_AM
+!           compatibleCoeffs(icoeff,icoeff2) = 0
+!           compatibleCoeffs(icoeff2,icoeff) = 0
+!!TEST_AM
+!         end if
+!       end if
+
+       ! TODO: hexu: Check if this is only valid for orthogonal structures. As it takes the x component of the rprimd
+       ! to compare.
+       ! Here it checks: for two pairs of atom with icoeff (a-b)  and icoeff2 (c-d).
+       !. (a) a-d along x. (b) a-d along y. (c) a-d along z are within the range.
+       ! As a-b and c-d are within the cutoff, and a==c, there is no more need to check.
+
+
+       if(icoeff<=ncoeff_symsym.and.icoeff2<=ncoeff_symsym)then !Check combination of irreducible bodies and their symmetric equivalent
+         if(list_symcoeff(2,icoeff,1)/= list_symcoeff(2,icoeff2,1)) then
+           ABI_BUG("The first components of the pairs in the coefficient are not equivalent.")
+         end if
+
+          if(abs(dist(1,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff,1),list_symcoeff(4,icoeff,1)) & ! rx(a, b)
+&            -dist(1,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff2,1),list_symcoeff(4,icoeff2,1))) & ! rx(a, d )
+&            >= (rprimd(1,1) + rprimd(1,2) + rprimd(1,3))*sc_size(1)  .or. &
+             abs(dist(2,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff,1),list_symcoeff(4,icoeff,1)) &  ! ry(a, b)
+&            -dist(2,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff2,1),list_symcoeff(4,icoeff2,1))) &  ! ry(a, d)
+&            >= (rprimd(2,1) + rprimd(2,2) + rprimd(2,3))*sc_size(2)  .or. &
+             abs(dist(3,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff,1),list_symcoeff(4,icoeff,1)) &  ! rz(a, b)
+&            -dist(3,list_symcoeff(2,icoeff,1),list_symcoeff(3,icoeff2,1),list_symcoeff(4,icoeff2,1))) &  ! rz(a, d)
+&            >= (rprimd(3,1) + rprimd(3,2) + rprimd(3,3))*sc_size(3))then
+             compatibleCoeffs(icoeff,icoeff2) = 0
+             compatibleCoeffs(icoeff2,icoeff) = 0
+          endif
+       endif
+     end do !end  icoeff
+   end do !icoeff2
+
+ ABI_FREE(dist)
+!  Compute all the combination of coefficient up to the given order  (get the number)
+   if(need_verbose)then
+     write(message,'(1a)')' Compute the number of possible combinations'
+     call wrtout(std_out,message,'COLL')
+   end if
+
+   ABI_MALLOC(list_coeff,(0))
+   ABI_MALLOC(list_combination,(0,0))
+   icoeff  = 1
+   icoeff2 = 0
+   nirred_comb = 0
+   iirred_comb = 0
+   call computeCombinationFromList(cell,compatibleCoeffs,list_symcoeff,list_symstr,&
+&                   list_coeff,list_combination,icoeff,max_power_strain,natom,ncoeff_sym,&
+&                   ncoeff_symsym,iirred_comb,nirred_comb,nstr_sym,icoeff,nrpt,nsym,1,power_disps(1),power_disps(2),symbols,comm,&
+&                   nbody=option,compute=.false.,anharmstr=need_anharmstr,spcoupling=need_spcoupling,&
+&                   only_odd_power=need_only_odd_power,only_even_power=need_only_even_power,disp=need_dispterms)
+   ABI_FREE(list_coeff)
+   ABI_FREE(list_combination)
+
+!  Output how much we found
+   if(need_verbose)then
+     write(message,"(1a,I10)") "  -Number of irreducible pairs within cutoff:   ", ncoeff_sym
+     call wrtout(std_out,message,'COLL')
+     write(message,"(1a,I10)") "  -Number of combinations of irreducible pairs: ", nirred_comb
+     call wrtout(std_out,message,'COLL')
+     !write(message,"(1a,I10)") "  -Number of possible symmetric combinations:   ", ncombination
+     !call wrtout(std_out,message,'COLL')
+     write(message,'(a,a)') ch10,' Compute the combinations of irreducible pairs'
+     call wrtout(std_out,message,'COLL')
+   end if
+   ABI_MALLOC(list_coeff,(0))
+   ABI_MALLOC(list_combination_tmp,(power_disps(2),nirred_comb))
+   icoeff  = 1
+   icoeff2 = 0
+   iirred_comb = 0
+   list_combination_tmp = 0
+!  Compute all the combination of coefficient up to the given order
+   call computeCombinationFromList(cell,compatibleCoeffs,list_symcoeff,list_symstr,&
+&                   list_coeff,list_combination_tmp,icoeff,max_power_strain,natom,&
+&                   ncoeff_sym,ncoeff_symsym,iirred_comb,nirred_comb,nstr_sym,ncombination,nrpt,nsym,1,power_disps(1),&
+&                   power_disps(2),symbols,comm,nbody=option,compute=.true.,&
+&                   anharmstr=need_anharmstr,spcoupling=need_spcoupling,&
+&                   only_odd_power=need_only_odd_power,only_even_power=need_only_even_power,disp=need_dispterms)
+   ABI_FREE(list_coeff)
+   nirred_comb = size(list_combination_tmp,2)
+
+! If we want to compute equivalent symmetric combinations go here.
+if(need_compute_symmetric)then
+  if(need_verbose)then
+    write(message,'(1a)')' Distribute irreducible combinations over CPU'
+    call wrtout(std_out,message,'COLL')
+    write(message,'(1a)')' Compute symmetric combinations of combinations of irreducible pairs'
+    call wrtout(std_out,message,'COLL')
+    write(message,'(3a)')' ---> Try to match number of CPU to number combinations of irreducible pairs',ch10,&
+    &                    '      for max. speedup'
+    call wrtout(std_out,message,'COLL')
+  endif
+
+  ! COUNT IRREDUCIBLE COMBINATIONS FOR EACH PROCESSOR
+  ncombi_alone = mod(nirred_comb,nproc)
+  my_ncombi_simple = int(aint(real(nirred_comb,sp)/(nproc)))
+  if(ncombi_alone == 0 .and. nirred_comb >= nproc)then !ncombi > nproc and no remainder
+    my_ncombi_start = (my_ncombi_simple * my_rank) + 1
+    my_ncombi_end   = my_ncombi_start + my_ncombi_simple - 1
+  else if(nirred_comb < nproc)then  !ncombi smaller than nproc
+    if(my_rank + 1 <= nirred_comb)then !myrank smaller than ncombi
+      my_ncombi_start = my_rank + 1
+      my_ncombi_end = my_ncombi_start
+    else
+      my_ncombi_start = nirred_comb + 1 !myrank bigger than ncombi
+      my_ncombi_end = nirred_comb + 1
+    endif
+  else if(nirred_comb > nproc .and. ncombi_alone /= 0)then !ncombi > nproc and remainder
+    if(my_rank >= (nproc-ncombi_alone)) then
+      my_ncombi_start = (my_ncombi_simple * my_rank) + 1 + (my_rank - nproc + ncombi_alone)
+      my_ncombi_end = my_ncombi_start + my_ncombi_simple
+    else
+      my_ncombi_start = (my_ncombi_simple * my_rank) + 1
+      my_ncombi_end   = my_ncombi_start + my_ncombi_simple - 1
+    endif
+  end if
+
+  if(my_ncombi_end <= nirred_comb)then
+     my_nirred = my_ncombi_end+1-my_ncombi_start
+  else
+     my_nirred = 0
+  endif
+
+
+  !write(std_out,*) "my_rank", my_rank, "my_ncmobi_start", my_ncombi_start, "my_ncombi_end", my_ncombi_end,'my_nirred',my_nirred
+
+  !COPY IRREDUCIBLE COMBINTATIONS TO BE DONE TO EACH PROCESSOR
+  !my_nirred = my_ncombi_end - my_ncombi_start + 1
+  ABI_MALLOC(my_list_combination_tmp,(power_disps(2),my_nirred))
+  if(my_nirred /= 0)my_list_combination_tmp(:,:) = list_combination_tmp(:,my_ncombi_start:my_ncombi_end)
+  ABI_MALLOC(my_index_irredcomb,(my_nirred))
+  !DEALLOCATE list_combination_tmp
+  ABI_FREE(list_combination_tmp)
+
+  !COUNT SYMMETRIC COMBINATIONS TO IRREDUCIBLE COMBINATIONS ON EACH PROCESSOR
+
+
+ if (my_nirred /= 0 ) then
+     my_ncombi = my_nirred*(nsym**(power_disps(2)))
+ end if
+
+  !Copy irreducible combinations from list_combination tmp into my_list_combination on rank i
+  !Make my_list_combination large enough for all symmetric combinations
+
+  !ABI_MALLOC(my_list_combination,(power_disps(2),my_ncombi))
+  !my_list_combination = 0
+
+
+
+  !ABI_MALLOC(my_index_irredcomb,(my_ncombi_end-my_ncombi_start+1))
+!  if(my_ncombi /= 0)then
+!    do i=1,my_nirred
+!       my_list_combination(:,1+(i-1)*(nsym**(power_disps(2)))) = my_list_combination_tmp(:,i)
+!       my_index_irredcomb(i) = 1+(i-1)*(nsym**(power_disps(2)))
+!    end do
+!  endif
+
+  !FOREGET ABOUT MY_LIST_COMBINATION_TMP
+  !COMPUTE SYMMETRIC COMBINATIONS
+  if(my_ncombi /= 0)then
+    do i=1,my_nirred
+      associate(comb => my_list_combination_tmp(:, i))
+        !ABI_MALLOC(dummylist,(0))
+        ! Get number of strain and displacements for this term
+        ndisp = 0
+        nstrain = 0
+        do ii = 1,power_disps(2)
+          if(comb(ii) > 0 .and. comb(ii) <= ncoeff_symsym)then
+            ndisp = ndisp + 1
+          else if(comb(ii) >= ncoeff_symsym)then
+            nstrain = nstrain + 1
+          endif
+        enddo
+       compute_sym = .true.
+       iterm = my_index_irredcomb(i)-1
+       call computeSymmetricCombinations(my_array_combination,list_symcoeff,list_symstr,ndisp,nsym,&
+&                                        comb(:ndisp+nstrain),power_disps(2),&
+&                                        my_ncombi,ncoeff_symsym,nstr_sym,nstrain, &
+&                                        compatibleCoeffs,compute_sym,comm,only_even=need_only_even_power)
+
+       !ABI_FREE(dummylist)
+     end associate
+    enddo
+  endif
+
+  ABI_FREE(my_list_combination_tmp)
+
+  ! Delete double combinations on each processor
+  if(need_verbose .and. my_nirred /= 0)then
+     write(message,'(1a,I4)')' Reduce reducible symmetric combinations on processor: ', my_rank+1
+     call wrtout(std_out,message,'PERS')
+  endif
+  ! TODO: put my_array_combination into my_list_combination.
+  !call reduce_zero_combinations(my_list_combination)
+  call my_array_combination%tostatic(my_list_combination, size1=power_disps(2))
+  call my_array_combination%finalize()
+
+
+  ! Gather the Results into list_combination_tmp
+  my_ncombi = size(my_list_combination,2)
+  ABI_MALLOC(irank_ncombi,(nproc))
+  call xmpi_allgather(my_ncombi,irank_ncombi,comm,ierr)
+  if(need_verbose)then
+    write(message,'(1a)')' Reduction on all processors finished. Gather results.'
+    call wrtout(std_out,message,'COLL')
+  endif
+  ABI_MALLOC(list_combination_tmp,(power_disps(2),sum(irank_ncombi)))
+  ABI_MALLOC(offsets,(nproc))
+  offsets(1) = 0
+  do i=1,nproc
+    offsets(i) = sum(irank_ncombi(:i-1))*power_disps(2)
+  enddo
+
+  list_combination_tmp = 0
+  ABI_MALLOC(buffsize,(nproc))
+  do i = 1,nproc
+    buffsize(i) = irank_ncombi(i)*power_disps(2)
+  enddo
+  call xmpi_gatherv(my_list_combination,size(my_list_combination),list_combination_tmp,buffsize,offsets,master,comm,ierr)
+
+  !Deallocation of variables inside need_symmetric
+  ABI_FREE(buffsize)
+  ABI_FREE(my_list_combination)
+  ABI_FREE(my_index_irredcomb)
+  ABI_FREE(irank_ncombi)
+  ABI_FREE(offsets)
+endif !compute_symmetric
+
+!Deallocation of arrays outside need_symmetric
+ABI_FREE(compatibleCoeffs)
+
+if(iam_master)then
+  call reduce_zero_combinations(list_combination_tmp)
+  ncombination = size(list_combination_tmp,2)
+  !ABI_MALLOC(index_irred,(1))
+  !index_irred = 1
+  if(need_spcoupling)then !Check irreducibility of strain-phonon terms
+   if(need_verbose)then
+     write(message,'(1a)')' Reduce reducible Strain-Phonon combinations on master'
+     call wrtout(std_out,message,'COLL')
+   endif
+
+   block
+     type(IrreducibleCombinations_T) :: irred_combinations
+     call irred_combinations%init()
+     do i=1, ncombination
+       if(any(list_combination_tmp(:,i) > ncoeff_symsym))then
+         irreducible=irred_combinations%add_irr(list_combination_tmp(:,i), &
+           & list_symcoeff, list_symstr, ncoeff_symsym, nsym, power_disps(2))
+         if(.not. irreducible) list_combination_tmp(:,i) = 0
+       endif
+     end do
+     call reduce_zero_combinations(list_combination_tmp)
+     ncombination = size(list_combination_tmp,2)
+     call irred_combinations%free()
+   end block
+ endif
+
+
+ !    do i=2,ncombination
+ !       if(any(list_combination_tmp(:,i) > ncoeff_symsym))then
+ !         !irreducible = check_irreducibility(list_combination_tmp(:,i),list_combination_tmp(:,:i-1),list_symcoeff,&
+ ! &       !                                   list_symstr,ncoeff_symsym,nsym,i-1,power_disps(2),index_irred)
+ !         !if(.not. irreducible) list_combination_tmp(:,i) = 0
+ !       endif
+ !    enddo
+ !    call reduce_zero_combinations(list_combination_tmp)
+ !    ncombination = size(list_combination_tmp,2)
+ ! ABI_FREE(index_irred)
+end if !iam_master
+if(need_verbose)then
+  write(message,'(1x,I0,1a)') ncombination,' irreducible combinations generated '
+  call wrtout(std_out,message,'COLL')
+  write(message,'(1a)') ' Finished generating irreducible combinations'
+  call wrtout(std_out,message,'COLL')
+endif
+
+ !ABI_FREE(xcart)
+ !ABI_FREE(xred)
+
+!MPI
+ if(need_verbose .and. nproc > 1)then
+   write(message,'(a,a)') ch10,' Redistribute the combinations over the CPU'
+   call wrtout(std_out,message,'COLL')
+ end if
+
+ call xmpi_bcast(ncombination, master, comm, ierr)
+
+ ncoeff_alone = mod(ncombination,nproc)
+ my_ncoeff = int(aint(real(ncombination,sp)/(nproc)))
+
+ if(my_rank >= (nproc-ncoeff_alone)) then
+   my_ncoeff = my_ncoeff  + 1
+ end if
+
+!Set the buffsize for mpi scatterv
+ ABI_MALLOC(buffsize,(nproc))
+ ABI_MALLOC(buffdispl,(nproc))
+ do ii = 1,nproc
+   buffsize(ii) = int(aint(real(ncombination,sp)/(nproc))*power_disps(2))
+   if(ii > (nproc-ncoeff_alone)) then
+     buffsize(ii) = buffsize(ii) + power_disps(2)
+   end if
+ end do
+
+ buffdispl(1) = 0
+ do ii = 2,nproc
+   buffdispl(ii) = buffdispl(ii-1) + buffsize(ii-1)
+ end do
+
+ ABI_MALLOC(list_combination,(power_disps(2),my_ncoeff))
+ list_combination = 0
+
+ my_size = my_ncoeff*power_disps(2)
+ call xmpi_scatterv(list_combination_tmp,buffsize,buffdispl,list_combination,my_size,master,&
+&                   comm,ierr)
+
+ ABI_FREE(buffdispl)
+ ABI_FREE(buffsize)
+ ABI_FREE(list_combination_tmp)
+
+!write(std_out,*) "DEBUG shape list_symcoeff(:,:,:) before termsfromlist:", shape(list_symcoeff)
+ !Compute the coefficients from the list of combination
+ if(need_verbose .and. nproc > 1)then
+   write(message,'(1a)')' Compute the coefficients'
+   call wrtout(std_out,message,'COLL')
+ end if
+ ABI_MALLOC(coeffs_tmp,(my_ncoeff))
+ nterm      = nsym
+ ndisp_max  = power_disps(2)
+ ncoeff_max = my_ncoeff
+ do ii=1,my_ncoeff
+   ABI_MALLOC(terms,(nterm))
+   !write(std_out,*) "DEBUG list_combination(:,",ii,"): ", list_combination(:,ii)
+   block
+     logical :: reverse(ndisp_max)
+     reverse=.False.
+     call generateTermsFromList(cell,list_combination(:,ii),list_symcoeff,list_symstr,ncoeff_symsym,&
+&                             ndisp_max,nrpt,nstr_sym,nsym,nterm,terms, reverse=reverse)
+     call polynomial_coeff_init(one,nterm,coeffs_tmp(ii),terms(1:nterm),check=.true.)
+   end block
+   !  Free the terms array
+   do iterm=1,nterm
+     call polynomial_term_free(terms(iterm))
+   end do
+   ABI_FREE(terms)
+ end do
+ ABI_FREE(cell)
+
+
+ ABI_FREE(list_combination)
+ ABI_FREE(list_symcoeff)
+ ABI_FREE(list_symstr)
+
+!Final tranfert
+!1- Count the total number of coefficient
+ ncoeff = 0
+ do icoeff=1,ncoeff_max
+   if (abs(coeffs_tmp(icoeff)%coefficient) >tol16) then
+     ncoeff = ncoeff + 1
+   end if
+ end do
+
+!Get the total number of coefficients
+!ncoeff_max is the number of total coefficients before the symetries check
+!ncoeff_tot is the number of total coefficients after the symetries check
+ ncoeff_tot = ncoeff!set the output
+ call xmpi_sum(ncoeff_tot,comm,ierr)
+ call xmpi_sum(ncoeff_max,comm,ierr)
+
+
+!Need to redistribute the coefficients over the CPU
+!Get the list with the number of coeff on each CPU
+!In order to be abble to compute the my_coeffindexes array which is for example:
+! if CPU0 has 200  Coeff and CPU1 has 203 Coeff then
+! for CPU0:my_coeffindexes=>1-200 and for CPU1:my_coeffindexes=>201-403
+ if(need_verbose .and. nproc > 1)then
+   write(message,'(1a)')' Redistribute the coefficients over the CPU'
+   call wrtout(std_out,message,'COLL')
+ end if
+
+ ABI_MALLOC(buffdispl,(nproc))
+ buffdispl = 0
+ buffdispl(my_rank+1) = my_ncoeff
+ call xmpi_sum(buffdispl,comm,ierr)
+ ABI_MALLOC(my_coeffindexes,(my_ncoeff))
+ ABI_MALLOC(my_coefflist,(my_ncoeff))
+ my_coeffindexes = 0
+ my_coefflist = 0
+ do icoeff=1,my_ncoeff
+   my_coefflist(icoeff) = icoeff
+   if(my_rank==0) then
+     my_coeffindexes(icoeff) = icoeff
+   else
+     my_coeffindexes(icoeff) = sum(buffdispl(1:my_rank)) + icoeff
+   end if
+ end do
+ ABI_FREE(buffdispl)
+
+!Compute the new number of coefficient per CPU
+ if(need_distributed) then
+   ncoeff_alone = mod(ncoeff_tot,nproc)
+   my_newncoeff = int(aint(real(ncoeff_tot,sp)/(nproc)))
+   if(my_rank >= (nproc-ncoeff_alone)) then
+     my_newncoeff = my_newncoeff  + 1
+   end if
+ else
+   my_newncoeff = ncoeff_tot
+ end if
+
+ ncoeff = my_newncoeff ! Set the output
+
+!2:compute the number of coefficients and the list of the corresponding
+!  coefficients for each CPU.
+ ABI_MALLOC(my_newcoeffindexes,(my_newncoeff))
+ if(need_distributed) then
+   do icoeff=1,my_newncoeff
+     if(my_rank >= (nproc-ncoeff_alone))then
+       my_newcoeffindexes(icoeff)=int(aint(real(ncoeff_tot,sp)/(nproc)))*(my_rank)+&
+&                              (my_rank - (nproc-ncoeff_alone)) + icoeff
+     else
+       my_newcoeffindexes(icoeff)=(my_newncoeff)*(my_rank)  + icoeff
+     end if
+   end do
+ else
+   do icoeff=1,my_newncoeff
+     my_newcoeffindexes(icoeff) = icoeff
+   end do
+ end if
+
+!2- Transfer
+ if(.not.need_distributed)then
+   if(.not.allocated(coefficients))then
+     ABI_MALLOC(coefficients,(my_newncoeff))
+   end if
+ end if
+ icoeff  = 0! icoeff is the current index in the total list of coefficients
+ icoeff2 = 0! icoeff2 is the current index in the output coefficients array on each CPU
+ icoeff3 = 0! icoeff3 is the current index in total new list of coefficients
+ rank_to_send_save = 0
+
+ do icoeff=1,ncoeff_max
+!  Need to send the rank with the chosen coefficient
+   rank_to_send = 0
+   my_icoeff = 0
+   do ii=1,my_ncoeff
+     if (my_coeffindexes(ii)==icoeff) then
+       my_icoeff = ii
+       if (abs(coeffs_tmp(my_icoeff)%coefficient) > tol16)then
+         rank_to_send = my_rank
+       else
+         rank_to_send = -1
+!        Free the coefficient
+         call polynomial_coeff_free(coeffs_tmp(ii))
+       end if
+       exit
+     end if
+   end do
+   call xmpi_sum(rank_to_send, comm, ierr)
+!  This coefficient is not compute
+   if (rank_to_send == -1) cycle
+
+!  increase icoeff3
+   icoeff3 = icoeff3 + 1
+
+!  Find the receiver CPU
+   rank_to_receive = 0
+   do ii=1,my_newncoeff
+     if (my_newcoeffindexes(ii)==icoeff3) then
+       rank_to_receive = my_rank
+     end if
+   end do
+   call xmpi_sum(rank_to_receive, comm, ierr)
+
+   if(need_distributed.and.rank_to_send /= rank_to_send_save) then
+     if(my_rank == rank_to_send_save)then
+       ABI_FREE(coeffs_tmp)!Free memory if the current CPU has already distribute
+                                          !all its own coefficients
+     end if
+     rank_to_send_save = rank_to_send
+   end if
+
+   if(need_distributed.and.my_rank == rank_to_receive)then
+     if(.not.allocated(coefficients))then
+       ABI_MALLOC(coefficients,(my_newncoeff))
+     end if
+   end if
+
+
+   if (need_distributed)then
+     if(my_rank==rank_to_send)then
+       if(any(my_newcoeffindexes(:)==icoeff3))then
+         icoeff2 = icoeff2 + 1
+!        Get the name of this coefficient
+         call polynomial_coeff_getName(name,coeffs_tmp(my_icoeff),symbols,recompute=.TRUE.)
+         call polynomial_coeff_init(one,coeffs_tmp(my_icoeff)%nterm,coefficients(icoeff2),&
+&                                  coeffs_tmp(my_icoeff)%terms,name=name,check=.false.)
+       else
+         call polynomial_coeff_MPIsend(coeffs_tmp(my_icoeff), icoeff, rank_to_receive, comm)
+       end if
+!      Free the coefficient
+       call polynomial_coeff_free(coeffs_tmp(my_icoeff))
+     else
+       if(any(my_newcoeffindexes(:)==icoeff3))then
+         icoeff2 = icoeff2 + 1
+         call polynomial_coeff_MPIrecv(coefficients(icoeff2), icoeff, rank_to_send, comm)
+         call polynomial_coeff_getName(name,coefficients(icoeff2),symbols,recompute=.TRUE.)
+         call polynomial_coeff_SetName(name,coefficients(icoeff2))
+       end if
+     end if
+   else
+     icoeff2 = icoeff2 + 1
+!    Get the name of this coefficient
+     if(my_rank==rank_to_send)then
+       call polynomial_coeff_getName(name,coeffs_tmp(my_icoeff),symbols,recompute=.TRUE.)
+       call polynomial_coeff_init(one,coeffs_tmp(my_icoeff)%nterm,coefficients(icoeff2),&
+&                                 coeffs_tmp(my_icoeff)%terms,name=name,check=.false.)
+!      Free the coefficient
+       call polynomial_coeff_free(coeffs_tmp(my_icoeff))
+     end if
+     call polynomial_coeff_broadcast(coefficients(icoeff2),rank_to_send, comm)
+   end if
+ end do
+
+!Debug write xml
+!     write (filename, "(A9,I2,A4)") "terms_set", my_rank+1,".xml"
+!     call polynomial_coeff_writeXML(coefficients,my_newncoeff,filename=filename)
+
+ if(need_verbose)then
+   write(message,'(1x,I0,2a)') ncoeff_tot,' coefficients generated ',ch10
+   call wrtout(ab_out,message,'COLL')
+   call wrtout(std_out,message,'COLL')
+ end if
+
+
+!Final deallocation
+ ABI_FREE(symbols)
+ ABI_FREE(my_coeffindexes)
+ ABI_FREE(my_newcoeffindexes)
+ ABI_FREE(my_coefflist)
+   ABI_SFREE(coeffs_tmp)
+
+end subroutine polynomial_coeff_getNorder
+!!***
+
+
+!!****f* m_polynomial_coeff/computeNorder
+!! NAME
+!! computeNorder
+!!
+!! FUNCTION
+!! Recursive routine to compute the order N of a all the possible coefficient
+!! from the list list_symcoeff and list_symstr.
+!!
+!! INPUTS
+!! cell(3,nrpt) = indexes of the cells into the supercell (-1 -1 -1, 0 0 0 ...)
+!! compatibleCoeffs(ncoeff+nstr,ncoeff+nstr) = array with the list of compatible coefficients 0 or 1
+!! list_symcoeff(6,ncoeff_sym,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! list_symstr(nstr_sym,nsym) = array with the list of the strain  and the symmetrics
+!! index_coeff_in(power_disp-1) = list of previous coefficients computed (start with 0)
+!! icoeff = current indexes of the cofficients (start we 1)
+!! icoeff_tot = current number of coefficients already computed (start we 0)
+!! natom = number of atoms in the unit cell
+!! nstr = number of coefficient for related to the atomic displacment into list_symcoeff
+!! nstr = number of coefficient for related to the strain into list_symstr
+!! ncoeff_out = number of maximum coefficients
+!! nrpt = number of cell
+!! nsym = number of symmetries in the system
+!! power_disp = initial power_disp to be computed (can be < power_disp_min,
+!!              this routine will skip the firts power_disp)
+!! power_disp_min = minimal power_disp to be computed
+!! power_disp_max = maximum power_disp to be computed
+!! symbols(natom) = array with the symbols of each atoms (Sr,O,Ti,...)
+!! nbody = optional, number of body for the coefficients, for example:
+!!                   0 => all the terms
+!!                   1 => only (Sr_x-T_y)^power_disp and (Sr_x-T_y)^power_disp\eta^power_disp  ...
+!! compute = logical, optional: TRUE if we store the coefficients
+!!                              FALSE just to count the number of coefficient
+!! anharmstr = logical, optional : TRUE, the anharmonic strain are computed
+!!                                   FALSE, (default) the anharmonic strain are not computed
+!! distributed = logical, optional : True, the coefficients will be distributed on the CPU
+!!
+!! OUTPUT
+!! icoeff = current indexes of the cofficients (start we 1)
+!! icoeff_tot = current number of coefficients already computed (start we 0)
+!! polynomial_coeff<(type(polynomial_coeff_type)>(ncoeff_out) = array of datatype with
+!!                                                              the polynomial_coeff
+!!
+!! SOURCE
+
+recursive subroutine computeNorder(cell,coeffs_out,compatibleCoeffs,list_coeff,list_str,&
+&                                  index_coeff_in,icoeff,icoeff_tot,natom,ncoeff,nstr,ncoeff_out,&
+&                                  nrpt,nsym,power_disp,power_disp_min,power_disp_max,symbols,nbody,&
+&                                  compute,anharmstr,spcoupling,distributed)
+
+ implicit none
+
+!Arguments ---------------------------------------------
+!scalar
+ integer,intent(in) :: natom,ncoeff,power_disp,power_disp_min,power_disp_max,ncoeff_out,nsym,nrpt,nstr,icoeff
+ integer,intent(inout) :: icoeff_tot
+ logical,optional,intent(in) :: compute,anharmstr,spcoupling,distributed
+ integer,optional,intent(in) :: nbody
+!arrays
+ integer,intent(in) :: cell(3,nrpt),compatibleCoeffs(ncoeff+nstr,ncoeff+nstr)
+ integer,intent(in) :: list_coeff(6,ncoeff,nsym),list_str(nstr,nsym,2)
+ integer,intent(in) :: index_coeff_in(power_disp-1)
+ type(polynomial_coeff_type),intent(inout) :: coeffs_out(ncoeff_out)
+ character(len=5),intent(in) :: symbols(natom)
+!Local variables ---------------------------------------
+!scalar
+ integer :: ia,ib,ii,icoeff1,icoeff_tmp
+ integer :: iterm,nbody_in,ncoeff_max,pa,pb
+ integer :: ndisp_max,nterm_max
+ real(dp):: coefficient
+ logical :: need_compute,compatible,possible,need_anharmstr,need_spcoupling,need_distributed
+!arrays
+ integer,allocatable :: index_coeff(:)
+ character(len=200):: name
+ type(polynomial_term_type),dimension(:),allocatable :: terms
+ type(polynomial_coeff_type),allocatable :: coeffs_tmp(:)
+! *************************************************************************
+
+!Set the inputs
+ need_compute = .TRUE.
+ need_anharmstr = .TRUE.
+ need_spcoupling = .TRUE.
+ need_distributed = .FALSE.
+ nbody_in = 0 !all kind of terms
+ if(present(compute)) need_compute = compute
+ if(present(nbody)) nbody_in = nbody
+ if(present(anharmstr)) need_anharmstr = anharmstr
+ if(present(spcoupling)) need_spcoupling = spcoupling
+ if(present(distributed)) need_distributed  = distributed
+ if(power_disp <= power_disp_max)then
+
+!  Initialisation of variables
+   nterm_max  = nsym
+   ncoeff_max = (ncoeff+nstr)
+   ndisp_max = power_disp
+   icoeff_tmp = 0
+   ABI_MALLOC(coeffs_tmp,(ncoeff_max))
+   ABI_MALLOC(terms,(nterm_max))
+   ABI_MALLOC(index_coeff,(power_disp))
+
+   index_coeff(1:power_disp-1) = index_coeff_in(:)
+
+   do icoeff1=icoeff,ncoeff+nstr
+!    If the distance between the 2 coefficients is superior than the cut-off,
+!    we cycle
+!    If the power_disp is one check if icoeff1 is compatible with itself
+     if(power_disp==1) then
+       if(icoeff1 <= ncoeff .and. compatibleCoeffs(icoeff1,icoeff1)==0)then
+         cycle
+       end if
+     end if
+     if(compatibleCoeffs(icoeff,icoeff1)==0) cycle
+
+!    Reset the flag compatible and possible
+     compatible = .TRUE.
+     possible   = .TRUE.
+
+     index_coeff(power_disp) = icoeff1
+     iterm = 0
+     coefficient = one
+
+     if(power_disp >= power_disp_min) then
+       block
+         logical :: reverse(ndisp_max)
+         reverse(:) = .False.
+         call generateTermsFromList(cell,index_coeff,list_coeff,list_str,ncoeff,&
+           &                                 ndisp_max,nrpt,nstr,nsym,iterm,terms, reverse=reverse)
+       end block
+
+       if(iterm > 0)then
+!        Do some checks
+!        -------------
+!        1-Check if the coefficient is full anharmonic strain and if we need to compute it
+         if(terms(1)%ndisp == 0)then
+           compatible = (need_anharmstr .or. need_spcoupling)
+           possible = need_anharmstr
+         end if
+!        1-Check if the coefficient is strain-coupling and if we need to compute it
+         if(terms(1)%nstrain > 0.and.terms(1)%ndisp > 0)then
+           possible   = need_spcoupling
+           compatible = need_spcoupling
+         end if
+
+!        ------------
+!        2-Check if this terms is compatible with nbody
+         if(nbody_in > 0)then
+           pa = 1 ; pb = 1
+           ia = 0 ; ib = 0
+!          Count the number of terms and the power_disp
+           do ii=1,terms(1)%ndisp
+             if(terms(1)%nstrain > 0) then
+               pb = pb*terms(1)%power_disp(ii)
+               ib = ib + 1
+             else
+               pa = pa*terms(1)%power_disp(ii)
+               ia = ia + 1
+             end if
+           end do
+           if(ia <= nbody_in)then
+             if(ia==nbody_in.and.abs(mod(pa,2)) < tol16)then
+               if(ib==0)then
+                 compatible = .FALSE.
+                 possible   = .TRUE.
+               else if (ib==nbody_in.and.abs(mod(pb,2)) < tol16) then
+                 compatible = .FALSE.
+                 possible   = .TRUE.
+               else
+                possible = .FALSE.
+                compatible = .FALSE.
+               end if
+             else
+                possible = .FALSE.
+                compatible = .FALSE.
+             end if
+           else
+             compatible = .FALSE.
+             possible = .FALSE.
+           end if
+         end if
+
+         if(possible)then
+!          increase coefficients and set it
+           icoeff_tmp = icoeff_tmp + 1
+           icoeff_tot = icoeff_tot + 1
+           call polynomial_coeff_init(coefficient,iterm,coeffs_tmp(icoeff_tmp),&
+&                                     terms(1:iterm),check=.true.)
+
+         end if
+       end if
+
+!      Deallocate the terms
+       do iterm=1,nterm_max
+         call polynomial_term_free(terms(iterm))
+       end do
+
+     end if!end if power_disp < power_disp_min
+
+     if(compatible)then
+       call computeNorder(cell,coeffs_out,compatibleCoeffs,list_coeff,list_str,index_coeff,&
+&                         icoeff1,icoeff_tot,natom,ncoeff,nstr,ncoeff_out,nrpt,nsym,power_disp+1,&
+&                         power_disp_min,power_disp_max,symbols,nbody=nbody_in,compute=need_compute,&
+&                         anharmstr=need_anharmstr,spcoupling=need_spcoupling)
+     end if
+   end do
+
+   ABI_FREE(terms)
+   ABI_FREE(index_coeff)
+
+!  Transfer in the final array
+   icoeff1 = 0
+   do icoeff_tmp=1,ncoeff_max
+     if (abs(coeffs_tmp(icoeff_tmp)%coefficient) > tol16)then
+!      Increase icoeff and fill the coeffs_out array
+       icoeff_tot = icoeff_tot + 1
+       if(need_compute)then
+         name = ''
+!        Get the name of this coefficient
+         call polynomial_coeff_getName(name,coeffs_tmp(icoeff_tmp),symbols,recompute=.TRUE.)
+         call polynomial_coeff_init(one,coeffs_tmp(icoeff_tmp)%nterm,&
+&                                   coeffs_out(icoeff_tot),coeffs_tmp(icoeff_tmp)%terms,&
+&                                   name=name)
+       end if
+     end if
+   end do
+!  Deallocation
+   do icoeff1=1,ncoeff_max
+     call polynomial_coeff_free(coeffs_tmp(icoeff1))
+   end do
+   ABI_FREE(coeffs_tmp)
+ end if
+
+end subroutine computeNorder
+!!***
+
+
+!!****f* m_polynomial_coeff/computeCombinationFromList
+!! NAME
+!! computeCombinationFromList
+!!
+!! FUNCTION
+!! Recursive routine to compute the order N of a all the possible coefficient
+!! from the list list_symcoeff and list_symstr.
+!!
+!! INPUTS
+!! cell(3,nrpt) = indexes of the cells into the supercell (-1 -1 -1, 0 0 0 ...)
+!! compatibleCoeffs(ncoeff+nstr,ncoeff+nstr) = array with the list of compatible coefficients 0 or 1
+!! list_coeff(6,ncoeff_sym,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! list_str(nstr_sym,nsym) = array with the list of the strain  and the symmetrics
+!! index_coeff_in(power_disp-1) = list of previous coefficients computed (start with 0)
+!! icoeff = current indexes of the combination (start with 1)
+!! max_power_strain = maximum order of the strain of the strain phonon coupling
+!! nmodel_tot = current number of combination already computed (start with 0)
+!! natom = number of atoms in the unit cell
+!! ncoeff = number of coefficient for related to the atomic displacment into list_symcoeff
+!! nstr = number of coefficient for related to the strain into list_symstr
+!! nmodel = number of maximum models
+!! nrpt = number of cell
+!! nsym = number of symmetries in the system
+!!     For example, the sum of all the term like (Sr_y-O_y)^odd, are 0 by symetrie in cubic system.
+!!     Here, we build a list with: 0 this term is not allowed for odd
+!!                                 1 this term is allowed for odd
+!! power_disp = initial power_disp to be computed (can be < power_disp_min,
+!!              this routine will skip the first power_disp)
+!! power_disp_min = minimal power_disp to be computed
+!! power_disp_max = maximum power_disp to be computed
+!! symbols(natom) = array with the symbols of each atoms (Sr,O,Ti,...)
+!! nbody = optional, number of body for the coefficients, for example:
+!!                   0 => all the terms
+!!                   1 => only (Sr_x-T_y)^power_disp and (Sr_x-T_y)^power_disp\eta^power_disp  ...
+!! compute = logical, optional: TRUE if we store the coefficients
+!!                              FALSE just to count the number of coefficient
+!! anharmstr = logical, optional : TRUE, the anharmonic strain are computed
+!!                                   FALSE, (default) the anharmonic strain are not computed
+!! distributed = logical, optional : True, the coefficients will be distributed on the CPU
+!! only_odd_power = logical, optional : if TRUE return only odd power
+!! only_even_power= logical, optional : if TRUe return only even power
+!!
+!! OUTPUT
+!! icoeff = current indexes of the cofficients (start we 1)
+!! nmodel_tot = current number of coefficients already computed (start we 0)
+!! list_combination = list of the possible combination of coefficients
+!!
+!! SOURCE
+
+recursive subroutine computeCombinationFromList(cell,compatibleCoeffs,list_coeff,list_str,&
+&                                  index_coeff_in,list_combination,icoeff,max_power_strain,&
+&                                  natom,ncoeff,ncoeff_sym,iirred_comb,nirred_comb,nstr,nmodel,nrpt,nsym,power_disp,power_disp_min,&
+&                                  power_disp_max,symbols,comm,nbody,only_odd_power,only_even_power,&
+&                                  compute,anharmstr,spcoupling,disp)
+
+ implicit none
+
+!Arguments ---------------------------------------------
+!scalar
+ integer,intent(in) :: natom,ncoeff,ncoeff_sym,power_disp,power_disp_min,power_disp_max
+ integer,intent(in) :: max_power_strain,nmodel,nsym,nrpt,nstr,comm,icoeff
+ integer,intent(inout) :: nirred_comb,iirred_comb
+ logical,optional,intent(in) :: compute,anharmstr,spcoupling,disp
+ integer,optional,intent(in) :: nbody
+ logical,optional,intent(in) :: only_odd_power,only_even_power
+!arrays
+ integer,intent(in) :: cell(3,nrpt),compatibleCoeffs(ncoeff_sym+nstr,ncoeff_sym+nstr)
+ integer,intent(in) :: list_coeff(6,ncoeff_sym,nsym),list_str(nstr,nsym,2)
+ integer,intent(in) :: index_coeff_in(power_disp-1)
+ integer,intent(out) :: list_combination(power_disp_max,nirred_comb)
+ character(len=5),intent(in) :: symbols(natom)
+!Local variables ---------------------------------------
+!scalar
+ integer :: icoeff1,icoeff2,nbody_in,ii,jj,nbody_count
+ integer :: ndisp_out,nstrain
+ logical :: need_compute,compatible,possible,need_anharmstr,need_spcoupling
+ logical :: need_only_odd_power,need_only_even_power,compute_sym,need_disp
+!arrays
+ integer :: powers(power_disp)
+ integer,allocatable :: index_coeff(:)
+! *************************************************************************
+
+ !Set the inputs
+ need_compute = .TRUE.
+ need_anharmstr = .TRUE.
+ need_spcoupling = .TRUE.
+ need_disp = .TRUE.
+ need_only_odd_power = .FALSE.
+ need_only_even_power = .FALSE.
+ compute_sym = .FALSE. !Never compute the symmetric combinations here
+ nbody_in = 0 !all kind of terms
+ if(present(compute)) need_compute = compute
+ if(present(nbody)) nbody_in = nbody
+ if(present(anharmstr)) need_anharmstr = anharmstr
+ if(present(spcoupling)) need_spcoupling = spcoupling
+ if(present(disp)) need_disp = disp
+ if(present(only_odd_power)) need_only_odd_power = only_odd_power
+ if(present(only_even_power)) need_only_even_power = only_even_power
+
+ if(power_disp <= power_disp_max)then
+
+   !  Initialisation of variables
+   ABI_MALLOC(index_coeff,(power_disp))
+   index_coeff(1:power_disp-1) = index_coeff_in(:)
+   !   write(std_out,*) "DEBUG index_coff in recursive CCL: ", index_coeff
+   !  Loop over ncoeff+nstr
+   do icoeff1=icoeff,ncoeff+nstr
+
+     !    Reset the flag compatible and possible
+     compatible = .TRUE.
+     possible   = .TRUE.
+
+     !    If the power_disp is one, we need to set icoeff to icoeff1
+     if(power_disp==1) then
+       if(icoeff1<=ncoeff .and. compatibleCoeffs(icoeff,icoeff1)==0)then
+         ! is_displacement and compatible
+         compatible = .FALSE.
+       end if
+     end if
+     !    If the distance between the 2 coefficients is superior than the cut-off, we cycle.
+     do icoeff2=1,power_disp-1
+       !      write(std_out,*) "icoeff1: ", icoeff1
+       !      write(std_out,*) "icoeff2: ", icoeff2, "index_icoeff2: ", index_coeff(icoeff2)
+       if(icoeff1 <= ncoeff .and. index_coeff(icoeff2) <=ncoeff)then
+         if(compatibleCoeffs(index_coeff(icoeff2),icoeff1)==0)then
+           compatible = .FALSE.
+         end if
+       endif
+     end do
+
+     if (.not.compatible) cycle !The distance is not compatible
+
+     !    Set the index of the new coeff in the list
+     index_coeff(power_disp) = icoeff1
+     !    Do some checks
+     !    -------------
+     !    1-Check if the coefficient is full anharmonic strain and if we need to compute it
+     if(all(index_coeff > ncoeff))then
+       compatible = (need_anharmstr .or. need_spcoupling)
+       possible = need_anharmstr
+     end if
+     !    2-Check if the coefficient is strain-coupling and if we need to compute it
+     if(any(index_coeff <= ncoeff) .and. any(index_coeff > ncoeff))then
+       !       write(std_out,*) "index_coeff", index_coeff,"need_spcoupling",need_spcoupling
+       possible   = need_spcoupling
+       compatible = need_spcoupling
+       if(count(index_coeff > ncoeff) > max_power_strain)then
+         possible = .false.
+         compatible = .false.
+       end if
+     end if
+     !    3-Check if the coefficient is only disp and if we need to compute it
+     if(all(index_coeff <= ncoeff))then
+       !       write(std_out,*) "index_coeff", index_coeff,"need_dis",need_disp
+       compatible = (need_disp .or. need_spcoupling)
+       possible = need_disp
+     end if
+     !    4-Count number of Strain and number of displacements for compute symmetric terms
+     nstrain = 0
+     ndisp_out = 0
+     do ii=1,power_disp
+       if(index_coeff(ii) > 0 .and. index_coeff(ii) <= ncoeff)then
+         ndisp_out = ndisp_out + 1
+       else
+         nstrain = nstrain +1
+         index_coeff(ii) = index_coeff(ii) - ncoeff + ncoeff_sym
+       end if
+     end do
+
+     if(power_disp >= power_disp_min) then
+
+       !      count the number of body
+       powers(:) = 1
+       do ii=1,power_disp
+         do jj=ii+1,power_disp
+           if (powers(jj) == 0) cycle
+           if(index_coeff(ii)==index_coeff(jj))then
+             powers(ii) = powers(ii) + 1
+             powers(jj) = 0
+           end if
+         end do
+       end do
+       nbody_count = count(powers /= 0)
+       !       write(std_out,*) "powers: ", powers
+       !       write(std_out,*) "nbody_count: ", nbody_count
+       !      check the only_odd and only_even flags
+       if(any(mod(powers(1:power_disp),2) /=0) .and. need_only_even_power) then
+         possible = .false.
+       end if
+       if(any(mod(powers(1:power_disp),2) ==0) .and. need_only_odd_power)then
+         possible = .false.
+       end if
+       !      Check the nbody flag
+       if(nbody_in /= 0)then
+         if(power_disp-count(powers==0) > nbody_in) then
+           possible = .false.
+           compatible = .false.
+         end if
+       end if
+
+       if(possible) then
+         !        increase coefficients and set it
+         !         nmodel_tot = nmodel_tot + 1
+         !         if(need_compute)then
+         !           list_combination(1:power_disp,nmodel_tot) = index_coeff
+         !         end if
+         !nmodel_tot_test = 0
+         !         !Start from second symmetry in Symmetric Combinations
+         !         isym_in_test = 2
+         !         idisp_in_test = power_disp
+         !         ndisp_test = power_disp
+         !         index_coeff_tmp = index_coeff
+         !Count anharmonic strain terms
+         if(ndisp_out == 0 .and. nstrain > 0)then
+           nirred_comb = nirred_comb +1
+           iirred_comb = iirred_comb +1
+           if(need_compute)then
+             list_combination(1:power_disp,iirred_comb) = index_coeff
+           endif
+         else !Else counst symmetric terms of atomic displacement (pure disp or disp/strain)
+           !Store index for each combination of irreducible terms to later parallely compute symmetric combinations
+           nirred_comb = nirred_comb +1
+           iirred_comb = iirred_comb +1
+           !write(std_out,*) "DEBUG index_coeff: ", index_coeff
+           !write(std_out,*) "DEBUG ndisp_out: ", ndisp_out
+           !write(std_out,*) "DEBUG nstrain: ", nstrain
+           !write(std_out,*) "DEBUG nmodel_start: ", nmodel_start
+           if(need_compute)then
+             list_combination(:,iirred_comb) = 0
+             list_combination(:ndisp_out+nstrain,iirred_comb) = index_coeff
+           endif
+         end if !ndisp_out == 0 .and.n nstrain >0
+       end if!possible
+     end if!end if power_disp < power_disp_min
+
+     !Change back to irreducible terms ncoeff_limit
+     do ii=1,power_disp
+       if(index_coeff(ii) > ncoeff_sym)then
+         index_coeff(ii) = index_coeff(ii) + ncoeff - ncoeff_sym
+       end if
+     end do
+
+     !    If the model is still compatbile with the input flags, we continue.
+     if(compatible)then
+       call computeCombinationFromList(cell,compatibleCoeffs,list_coeff,list_str,&
+         &                                     index_coeff,list_combination,icoeff1,max_power_strain,&
+         &                                     natom,ncoeff,ncoeff_sym,iirred_comb,nirred_comb,nstr,nmodel,nrpt,nsym,power_disp+1,&
+         &                                     power_disp_min,power_disp_max,symbols,comm,nbody=nbody_in,&
+         &                                     compute=need_compute,anharmstr=need_anharmstr,&
+         &                                     spcoupling=need_spcoupling,only_odd_power=need_only_odd_power,&
+         &                                     only_even_power=need_only_even_power,disp=need_disp)
+     end if
+   end do
+   ABI_FREE(index_coeff)
+ end if
+
+end subroutine computeCombinationFromList
+!!***
+
+!
+! create a list of symmetry operatings to one term.
+! nysm: number
+!
+! list:
+!subroutine gen_symlist(nsym, power, list)
+!  integer :: nsym, power, s
+!  integer, allocatable :: list(:, :)
+!  integer :: i, j, res,d
+!
+!  s=nsym**(power-1)
+!  ABI_MALLOC(list, (power, s))
+!  list(:, :) = 0
+!  if(power>0) then
+!    list(1, :) = 1
+!    do i=1, s
+!      d=i-1
+!      do j=1, power-1
+!        res=mod(d, nsym)
+!        d=d/nsym
+!        list(power-j+1, i) = res+1
+!      end do
+!    end do
+!  endif
+!end subroutine gen_symlist
+
+subroutine symlist_init(self, nsym, power)
+  class(symlist_t), intent(inout) :: self
+  integer, intent(in) :: nsym, power
+  integer(dp) :: nsym_dp, power_dp
+  nsym_dp=nsym
+  power_dp=power
+  if (power>0) then
+    self%nsym = nsym
+    self%power = power
+    self%max=nsym_dp**power_dp
+    self%counter=0
+  else if (power==0) then
+    self%max= 1
+    self%nsym = nsym
+    self%power = power
+    self%counter= 0
+  else
+    ABI_BUG("The power of the combination should be at least 1")
+  end if
+end subroutine symlist_init
+
+function symlist_next(self) result(list)
+  class(symlist_t), intent(inout) :: self
+  integer :: list(self%power)
+  integer :: j, res
+  integer(dp) :: d
+  list(:) = 0
+  self%counter = self%counter +1
+  if(self%counter>self%max) then
+    ABI_BUG("The iteration exceeded the number limit in symlist_next().")
+  end if
+  if (self%power>0) then
+    list(1) = 1
+    d=self%counter-1
+    do j=1, self%power
+      res=mod(d, self%nsym)
+      d=d/self%nsym
+      list(self%power-j+1) = res+1
+    end do
+  end if
+end function symlist_next
+
+subroutine symlist_free(self)
+  class(symlist_t) :: self
+  self%max=0
+  self%nsym = 0
+  self%power = 0
+  self%counter=0
+end subroutine symlist_free
+
+
+subroutine computeSymmetricCombinations(array_combination, &
+  & list_symcoeff, list_symstr, ndisp, nsym, index_coeff_in,  &
+  & ndisp_max, ncombinations, ncoeff, nsym_str, nstrain, &
+  &  compatibleCoeffs,  compute, comm, only_even  )
+
+  integer,intent(in)    :: ndisp,nsym,ndisp_max,ncombinations,ncoeff,nstrain,nsym_str
+  integer,intent(in)    :: comm
+  logical,intent(in)    :: compute
+  logical,optional,intent(in) :: only_even
+  !scalar
+  !arrays
+  !integer,intent(inout) ::
+  type(int2d_array_type), intent(inout) :: array_combination ! list_combination(ndisp_max, nirred*nsym**(ndisp-1))
+  integer,intent(in)    :: list_symcoeff(6,ncoeff,nsym),index_coeff_in(ndisp+nstrain)
+  integer,intent(in)    :: list_symstr(6,nsym,2),compatibleCoeffs(ncoeff+nsym_str,ncoeff+nsym_str)
+  type(IrreducibleCombinations_T) :: irred_combinations
+  type(symlist_t) :: symlist
+  !Local variables-------------------------------
+
+  integer :: idisp,idisp2,ii,jj
+  logical :: irreducible, need_only_even,possible
+
+  !arrays
+  integer :: index_coeff_tmp(ndisp),powers(ndisp),symcoeff_found(nsym)
+  integer :: comb_to_test(ndisp_max)
+  !integer,allocatable :: index_isym(:)
+  !integer,allocatable :: symlist(:, :)
+  integer(dp) :: isymlist
+  integer :: symlist_i(ndisp)
+  !Source
+
+  ABI_UNUSED(ncombinations)
+  ABI_UNUSED(compute)
+  ABI_UNUSED(comm)
+
+  need_only_even = .FALSE.
+  if(present(only_even))need_only_even=only_even
+  symcoeff_found = 0
+
+  irreducible = .TRUE.
+  !Only start the function if start-symmetry is smaller than maximum symmetry
+  !and start displacement is smaller than maximum displacement
+  !otherwise pass through
+
+  !call gen_symlist(nsym, ndisp, symlist)
+  call symlist%init(nsym, ndisp)
+  call irred_combinations%init()
+
+  !do isymlist=1, size(symlist, 2)
+  do isymlist=1, symlist%max
+    ! apply symmetry to the term, and check irreducibility
+    symlist_i(:) = symlist%next()
+    do idisp=1,ndisp
+      index_coeff_tmp(idisp) = list_symcoeff(6,index_coeff_in(idisp), symlist_i(idisp))
+    end do !idisp=1,ndisp
+    ! TODO: move it into subsubroutine.
+    powers(:) = 1
+    do ii=1,ndisp
+      do jj=ii+1,ndisp
+        if (powers(jj) == 0) cycle
+        if(index_coeff_tmp(ii)==index_coeff_tmp(jj))then
+          powers(ii) = powers(ii) + 1
+          powers(jj) = 0
+        end if
+      end do
+    end do
+    if(any(mod(powers(1:ndisp),2) /=0) .and. need_only_even) then
+      index_coeff_tmp(:) = 0
+    end if
+
+    !Check if symmetric combination is allowed
+    if(.not. any(index_coeff_tmp == 0))then ! Check if term is allowed by distance
+      do idisp=1,ndisp-1
+        do idisp2=idisp+1,ndisp
+          if(compatibleCoeffs(index_coeff_tmp(idisp),index_coeff_tmp(idisp2)) == 0) then
+            index_coeff_tmp = 0
+            exit
+          end if
+        enddo
+        if(all(index_coeff_tmp == 0))exit
+      enddo
+    endif
+
+    if(any(index_coeff_tmp == 0))then ! If symmetry doesn't point to another term or isn't allowed due to distance write zeros to filter after
+      possible = .FALSE.
+    else
+      possible = .TRUE.
+    endif
+
+    if(possible)then
+      !loop over displacements in term
+      comb_to_test(:) = 0
+      if(.not. (all(index_coeff_tmp == 0)))then ! If symmetry doesn't point to another term or isn't allowed due to distance write zeros to filter after
+        !list_combination(:,ncombi) = 0
+      !else
+        ! Set combination
+        !             write(std_out,*) "DEBUG ndisp,ncombi: ", ndisp, ncombi
+        !list_combination(:ndisp,ncombi) = index_coeff_tmp
+        comb_to_test(:ndisp) = index_coeff_tmp
+      end if! (any(index_coeff_tmp ==0))
+      if(nstrain /= 0)then !If SP coupling copy strain index
+          !list_combination(ndisp+1:ndisp+nstrain,ncombi) = index_coeff_in(ndisp+1:ndisp+nstrain) !TODO Check if shouldn't use index from list_symstr
+          comb_to_test(ndisp+1:ndisp+nstrain) = index_coeff_in(ndisp+1:ndisp+nstrain)
+      end if
+
+        ! Check if combination is irreducible
+        !ncombi_to_test = (ncombi) - ncombi_start
+        !             write(std_out,*) "DEBUG ncombi,ncombi_start and ncombi_to_test: ", ncombi,ncombi_start,ncombi_to_test
+        !if(ncombi_to_test >= 1)then
+          ! ncombi_start=ncombi+1
+          !irreducible = check_irreducibility(list_combination(:,ncombi),list_combination(:,ncombi_start:ncombi-1),&
+          !  &                                                  list_symcoeff,list_symstr,ncoeff,nsym,ncombi_to_test,ndisp_max,&
+          !  &                                                  index_irred)
+       if(.not. (all(index_coeff_tmp == 0) .and. nstrain==0)) then
+          irreducible=irred_combinations%add_irr(comb_to_test, list_symcoeff, list_symstr, ncoeff, nsym, ndisp_max)
+       endif
+        !endif
+        !write(std_out,*) "DEBUG ncombi", ncombi,"irreducible", irreducible
+        ! If not delete (set to zero)
+        !if(.not. irreducible) list_combination(:,ncombi) = 0
+        !write(std_out,*) "DEBUG, index_coeff_in,: ", index_coeff_in,"ndisp: ", ndisp
+        !write(std_out,*) "DEBUG, index_coeff_tmp,: ", index_coeff_in,"ndisp: ", ndisp
+    end if ! need compute
+  end do
+
+  call array_combination%concate(irred_combinations%array)
+  call symlist%free()
+  call irred_combinations%free()
+  !ABI_FREE(index_isym)
+end subroutine computeSymmetricCombinations
+
+!!****f* m_polynomial_coeff/getCoeffFromList
+!!
+!! NAME
+!! getCoeffFromList
+!!
+!! FUNCTION
+!! get the index of a coefficient into the list_coeff
+!!
+!! INPUTS
+!! list_symcoeff(6,ncoeff_sym,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! ia = index of the atom 1
+!! ib = index of the atom 1
+!! irpt = indexes of the cell of the second atom
+!! mu = direction of the IFC
+!! ncoeff = number of total coefficients in the list
+!!
+!! OUTPUT
+!! coeff = index of the coefficient
+!!
+!! SOURCE
+
+function getCoeffFromList(list_coeff,ia,ib,irpt,mu,ncoeff) result(coeff)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalar
+ integer,intent(in) :: ia,ib,irpt,mu,ncoeff
+ integer :: coeff
+!arrays
+ integer,intent(in) :: list_coeff(6,ncoeff)
+!Local variables-------------------------------
+!scalar
+ integer :: icoeff
+!arrays
+
+! *************************************************************************
+ coeff = 0
+ !write(std_out,*) "DEBUG shape inside FromList: ", shape(list_coeff)
+ do icoeff = 1,ncoeff
+   if(mu==list_coeff(1,icoeff).and.&
+&     ia==list_coeff(2,icoeff).and.&
+&     ib==list_coeff(3,icoeff).and.&
+&     irpt==list_coeff(4,icoeff))then!.and.&
+!&     abs(weight-list_coeff(5,icoeff)) < tol16) then
+     coeff = icoeff
+     exit
+   end if
+ end do
+
+end function getCoeffFromList
+!!***
+
+
+!!****f* m_polynomial_coeff/generateTermsFromList
+!!
+!! NAME
+!! generateTermsFromList
+!!
+!! FUNCTION
+!! Compute for a given list of index the correspondig set of terms
+!!
+!! INPUTS
+!! cell(3,nrpt) = indexes of the cells into the supercell (-1 -1 -1, 0 0 0 ...)
+!! index_coeff_in(ndisp) = list of coefficients to be computed
+!! list_symcoeff(6,ncoeff,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! list_symstr(nstr,nsym) = array with the list of the strain  and the symmetrics
+!! ncoeff = number of maximum coefficients in the list_symcoeff
+!! ndisp = number of maximum diplacement (phonon + strain)
+!! nrpt = number of cell
+!! nsym = number of symmetries in the system
+!!
+!! OUTPUT
+!! terms<(type(polynomial_term_type)>(nterm)  = list of terms
+!! nterm = number of ouput terms
+!!
+!! SOURCE
+
+subroutine generateTermsFromList(cell,index_coeff,list_coeff,list_str,ncoeff,ndisp_max,&
+&                                nrpt,nstr,nsym,nterm,terms, reverse)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalar
+ integer,intent(in) :: ndisp_max,ncoeff,nrpt,nstr,nsym
+ integer,intent(out):: nterm
+!arrays
+ integer,intent(in) :: index_coeff(ndisp_max)
+ integer,intent(in) :: cell(3,nrpt),list_coeff(6,ncoeff,nsym)
+ integer,intent(in) :: list_str(nstr,nsym,2)
+ logical, intent(in) :: reverse(ndisp_max)
+ type(polynomial_term_type),intent(out) :: terms(nsym)
+!Local variables-------------------------------
+!scalar
+ integer :: ia,ib,icoeff_str,idisp,irpt
+ integer :: isym,ndisp,nstrain,mu
+ real(dp):: weight
+!arrays
+ integer :: atindx(2,ndisp_max),cells(3,2,ndisp_max),dir_int(ndisp_max),strain(ndisp_max)
+ integer :: power_disps(ndisp_max),power_strain(ndisp_max)
+
+! *************************************************************************
+ nterm = 0
+!Loop over symetries
+ do isym=1,nsym
+!Treat this coeff
+   weight = 1
+   ndisp = 0
+   nstrain = 0
+   do idisp=1,ndisp_max
+!    Get index of this displacement term
+!    Check if the index is not zero
+     if(index_coeff(idisp)==0)cycle
+     if(index_coeff(idisp)<=ncoeff)then
+       ndisp = ndisp + 1
+       mu   = list_coeff(1,index_coeff(idisp),isym)
+       if( reverse(idisp)) then
+         ia   = list_coeff(3,index_coeff(idisp),isym)
+         ib   = list_coeff(2,index_coeff(idisp),isym)
+         irpt = list_coeff(4,index_coeff(idisp),isym)
+         irpt = find_opposite_irpt(cell, irpt)
+         weight = -weight*list_coeff(5,index_coeff(idisp),isym)
+       else
+         ia   = list_coeff(2,index_coeff(idisp),isym)
+         ib   = list_coeff(3,index_coeff(idisp),isym)
+         irpt = list_coeff(4,index_coeff(idisp),isym)
+         weight = weight*list_coeff(5,index_coeff(idisp),isym)
+       end if
+!      Fill First term arrays
+       atindx(1,idisp) = ia; atindx(2,idisp) = ib;
+       dir_int(idisp) = mu
+       power_disps(idisp)   = 1
+       cells(:,1,idisp) = (/0,0,0/)
+       cells(:,2,idisp) = cell(:,irpt)
+     else
+       nstrain = nstrain + 1
+       icoeff_str = index_coeff(idisp)-ncoeff
+       strain(nstrain) = list_str(icoeff_str,isym,1)
+       power_strain(nstrain)  = 1
+       weight = weight*list_str(icoeff_str,isym,2)
+     end if
+   end do
+   nterm = nterm + 1
+   call polynomial_term_init(atindx,cells,dir_int,ndisp,nstrain,terms(nterm),power_disps,&
+&                            power_strain,strain,weight,check=.true.)
+ end do!end do sym
+
+
+end subroutine generateTermsFromList
+!!***
+
+
+!!****f* m_polynomial_coeff/polynomial_coeff_getOrder1
+!!
+!! NAME
+!! polynomial_coeff_getOrder1
+!!
+!! FUNCTION
+!! Compute the first order polynomial coefficients from the list
+!!
+!! INPUTS
+!! cell(3,nrpt) = indexes of the cells into the supercell (-1 -1 -1, 0 0 0 ...)
+!! cutoff_in = cut-off for the inter atomic forces constants
+!! list_symcoeff(6,ncoeff_sym,nsym) = array with the list of the coefficients,
+!!                                    for each coefficients (ncoeff_sym), we store the symmetrics(nsym)
+!!                                    the 6th first dimensions are :
+!!                                       1 = direction of the IFC
+!!                                       2 = index of the atom number 1 (1=>natom)
+!!                                       3 = index of the atom number 2 (1=>natom)
+!!                                       4 = indexes of the cell of the second atom
+!!                                           (the atom number 1 is always in the cell 0 0 0)
+!!                                       5 = weight of the term (-1 or 1)
+!!                                       6 = indexes of the symmetric
+!! natom = number of atoms in the unit cell
+!! nrpt = number of cell
+!! nsym = number of symmetries in the system
+!! symbols(natom) = array with the symbols of each atoms (Sr,O,Ti,...)
+!! comm = MPI communicator
+!!
+!! OUTPUT
+!! polynomial_coeff<(type(polynomial_coeff_type)>(ncoeff_out) = array of datatype with
+!!                                                              the polynomial_coeff
+!! ncoeff_out = number of coefficients
+!!
+!! SOURCE
+
+subroutine polynomial_coeff_getOrder1(cell,coeffs_out,list_symcoeff,&
+&                                     natom,ncoeff_out,ncoeff,nrpt,nsym,&
+&                                     symbols)
+
+ implicit none
+
+!Arguments ------------------------------------
+!scalars
+ integer,intent(in)  :: natom,ncoeff,nsym,nrpt
+ integer,intent(out) :: ncoeff_out
+!arrays
+ integer,intent(in) :: cell(3,nrpt)
+ integer,intent(in) :: list_symcoeff(6,ncoeff,nsym)
+ character(len=5),intent(in) :: symbols(natom)
+ type(polynomial_coeff_type),allocatable,intent(inout) :: coeffs_out(:)
+!Local variables-------------------------------
+!scalar
+ integer :: ia,ib,icoeff,icoeff_tmp,irpt,irpt_ref
+ integer :: isym,iterm,mu,ncoeff_max,ndisp,nstrain,nterm_max
+ real(dp):: coefficient,weight
+!arrays
+ integer,allocatable :: atindx(:,:),cells(:,:,:),dir_int(:)
+ integer,allocatable :: power_disps(:),power_strain(:),strain(:)
+ character(len=1) :: mutodir(9) = (/"x","y","z","1","2","3","4","5","6"/)
+ character(len=200):: name
+ character(len=500) :: message
+ type(polynomial_term_type),dimension(:),allocatable :: terms
+ type(polynomial_coeff_type),allocatable :: coeffs_tmp(:)
+!TEST_AM
+ character(len=fnlen) :: filename
+!TEST_AM
+! *************************************************************************
+
+!Initialisation of variables
+ nterm_max  = nsym
+ ncoeff_max = ncoeff
+ ndisp = 1
+ nstrain = 0
+ ABI_MALLOC(coeffs_tmp,(ncoeff_max))
+ ABI_MALLOC(terms,(nterm_max))
+
+
+ icoeff_tmp = 0
+ ABI_MALLOC(atindx,(2,ndisp))
+ ABI_MALLOC(cells,(3,2,ndisp))
+ ABI_MALLOC(dir_int,(ndisp))
+ ABI_MALLOC(power_disps,(ndisp))
+ ABI_MALLOC(power_strain,(nstrain))
+ ABI_MALLOC(strain,(nstrain))
+
+!Found the ref cell
+ irpt_ref = 1
+ do irpt=1,nrpt
+   if(all(cell(:,irpt)==0))then
+     irpt_ref = irpt
+     exit
+   end if
+ end do
+
+ write(message,'(3a)') " Irreductible coefficient and associated atom 1, atom 2 and direction:",ch10,&
+&                     " for the 1st order"
+ call wrtout(std_out,message,'COLL')
+
+ do icoeff=1,ncoeff
+!  Reset counter
+   iterm = 0
+   coefficient = one
+   do isym=1,nsym
+     ndisp   = 1
+     nstrain = 0
+     mu   = list_symcoeff(1,icoeff,isym)
+     ia   = list_symcoeff(2,icoeff,isym)
+     ib   = list_symcoeff(3,icoeff,isym)
+     irpt = list_symcoeff(4,icoeff,isym)
+     weight = list_symcoeff(5,icoeff,isym)
+!    Fill First term arrays
+     atindx(1,1) = ia; atindx(2,1) = ib;
+     dir_int(1) = mu
+     power_disps(1)   = 1
+     cells(:,1,1) = (/0,0,0/)
+     cells(:,2,1) = cell(:,irpt)
+     iterm = iterm + 1
+     call polynomial_term_init(atindx,cells,dir_int,ndisp,nstrain,terms(iterm),&
+&                              power_disps,power_strain,strain,weight,check=.true.)
+   end do!end do sym
+
+   if(iterm > 0)then
+!  increase coefficients and set it
+     icoeff_tmp = icoeff_tmp + 1
+     call polynomial_coeff_init(coefficient,iterm,coeffs_tmp(icoeff_tmp),terms(1:iterm),check=.true.)
+   end if
+
+!  Deallocate the terms
+   do iterm=1,nterm_max
+     call polynomial_term_free(terms(iterm))
+   end do
+ end do!end do coeff_sym
+
+ ABI_FREE(terms)
+ ABI_FREE(atindx)
+ ABI_FREE(cells)
+ ABI_FREE(dir_int)
+ ABI_FREE(power_disps)
+ ABI_FREE(power_strain)
+ ABI_FREE(strain)
+
+!Count the number of terms
+ ncoeff_out = 0
+ do icoeff_tmp=1,ncoeff_max
+   if (abs(coeffs_tmp(icoeff_tmp)%coefficient) > tol16)then
+     ncoeff_out = ncoeff_out + 1
+   end if
+ end do
+
+!Transfer in the final array
+ ABI_MALLOC(coeffs_out,(ncoeff_out))
+ icoeff = 0
+ do icoeff_tmp=1,ncoeff_max
+   if (abs(coeffs_tmp(icoeff_tmp)%coefficient) > tol16)then
+!    Get the name of this coefficient
+     call polynomial_coeff_getName(name,coeffs_tmp(icoeff_tmp),symbols,recompute=.TRUE.)
+!    Increase icoeff and fill the coeffs_out array
+     icoeff = icoeff + 1
+      call polynomial_coeff_init(one,coeffs_tmp(icoeff_tmp)%nterm,&
+ &                               coeffs_out(icoeff),coeffs_tmp(icoeff_tmp)%terms,name=name)
+
+     write(message,'(2a)')' ',trim(name)
+     call wrtout(std_out,message,'COLL')
+
+     do iterm = 1,coeffs_tmp(icoeff_tmp)%nterm
+       write(message,'(a,I0,a,I0,2a)') '    Atom ',coeffs_tmp(icoeff_tmp)%terms(iterm)%atindx(1,1),&
+&                       ' and atom ',coeffs_tmp(icoeff_tmp)%terms(iterm)%atindx(2,1),&
+&                       ' in the direction ',mutodir(coeffs_tmp(icoeff_tmp)%terms(iterm)%direction(1))
+       if(any(coeffs_tmp(icoeff_tmp)%terms(iterm)%cell(:,2,1)/=0))then
+         write(message,'(2a,I0,a,I0,a,I0,a)') trim(message),' in the cell ',&
+&                                       coeffs_tmp(icoeff_tmp)%terms(iterm)%cell(1,2,1),' ',&
+&                                       coeffs_tmp(icoeff_tmp)%terms(iterm)%cell(2,2,1),' ',&
+&                                       coeffs_tmp(icoeff_tmp)%terms(iterm)%cell(3,2,1),'.'
+       end if
+       call wrtout(std_out,message,'COLL')
+     end do
+   end if
+ end do
+
+!TEST_AM
+ filename = "terms_1st_order.xml"
+ call polynomial_coeff_writeXML(coeffs_out,ncoeff_out,filename=filename)
+!TEST_AM
+
+ write(message,'(a,1x,I0,a)') ch10,&
+&       ncoeff_out,' fitted coefficients for the 1st order '
+ call wrtout(ab_out,message,'COLL')
+ call wrtout(std_out,message,'COLL')
+
+!Deallocation
+ do icoeff=1,ncoeff_max
+   call polynomial_coeff_free(coeffs_tmp(icoeff))
+ end do
+ ABI_FREE(coeffs_tmp)
+
+end subroutine polynomial_coeff_getOrder1
+!!***
+
+!!****f* m_polynomial_coeff/polynomial_coeff_getEvenAnhaStrain
+!!
+!! NAME
+!! polynomial_coeff_getEvenAnhaStrain
+!!
+!! FUNCTION
+!! Get even anharmonic strain terms in defined range of order
+!!
+!! INPUTS
+!!
+!!
+!! OUTPUT
+!! polynomial_coeff<(type(polynomial_coeff_type)>(ncoeff_out) = array of datatype with
+!!                                                              the polynomial_coeff
+!! ncoeff_out = number of coefficients
+!!
+!! SOURCE
+subroutine polynomial_coeff_getEvenAnhaStrain(strain_terms,crystal,irred_ncoeff,power_strain,comm)
+
+ implicit none
+
+!Arguments ------------------------------------
+type(polynomial_coeff_type),allocatable,intent(inout) :: strain_terms(:)
+type(crystal_t), intent(inout) :: crystal
+integer,intent(out) :: irred_ncoeff
+integer,intent(in) :: power_strain(2)
+integer,intent(in) :: comm
+!scalars
+!arrays
+!Local variables-------------------------------
+real(dp) :: cutoff,coeff_ini
+integer :: ncoeff
+integer :: power_strph
+integer :: option
+integer :: icoeff1,icoeff2,start
+integer :: ncoeff_out
+logical,allocatable :: same(:)
+type(polynomial_coeff_type),allocatable :: strain_terms_tmp(:)
+!scalar
+!arrays
+integer :: sc_size(3)
+! *************************************************************************
+
+!Initialize Variables for call to polynomial_coeff_getNorder
+cutoff = zero
+power_strph = zero
+option = 0
+sc_size = (/1,1,1/)
+coeff_ini = 1000000
+
+
+call polynomial_coeff_getNorder(strain_terms_tmp,crystal,cutoff,ncoeff,ncoeff_out,power_strain,&
+&                               power_strph,option,sc_size,comm,anharmstr=.true.,spcoupling=.false.,&
+&                               only_odd_power=.false.,only_even_power=.true.,compute_symmetric=.false.,&
+                                verbose=.false.)
+
+
+!TODO Probably put in one routine
+!Get irreducible strain
+ABI_MALLOC(same,(ncoeff_out))
+same = .false.
+do icoeff1 =1,ncoeff_out
+        start = icoeff1 + 1
+        !write(*,*) "name coeff_",icoeff1,": ", strain_terms_tmp(icoeff1)%name
+        do icoeff2=start,ncoeff_out
+                if(.not.same(icoeff2)) same(icoeff2) = coeffs_compare(strain_terms_tmp(icoeff1),strain_terms_tmp(icoeff2))
+        enddo
+        !write(*,*) "same(",icoeff1,"): ", same(icoeff1)
+enddo
+
+irred_ncoeff = ncoeff_out - count(same)
+ABI_MALLOC(strain_terms,(irred_ncoeff))
+
+!Transfer irreducible strain to output array
+icoeff2=0
+icoeff1=0
+do icoeff1=1,ncoeff_out
+        if(.not.same(icoeff1))then
+                icoeff2=icoeff2 + 1
+                call polynomial_coeff_init(coeff_ini,strain_terms_tmp(icoeff1)%nterm,strain_terms(icoeff2),&
+&               strain_terms_tmp(icoeff1)%terms,strain_terms_tmp(icoeff1)%name,check=.TRUE.)
+        endif
+enddo
+
+!TEST MS write coefficients to xml to check
+!fname="EvenAnhaStrain.xml"
+!call polynomial_coeff_writeXML(strain_terms,irred_ncoeff,filename=fname,newfile=.true.)
+!write(*,*) "Strain terms to xml done"
+
+
+!Deallocateion
+call polynomial_coeff_list_free(strain_terms_tmp)
+ABI_FREE(same)
+
+end subroutine polynomial_coeff_getEvenAnhaStrain
+!!***
+
+!!****f* m_polynomial_coeff/coeffs_compare
+!! NAME
+!!  equal
+!!
+!! FUNCTION
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+function coeffs_compare(c1,c2) result (res)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+  type(polynomial_coeff_type), intent(in) :: c1,c2
+  logical :: res
+!local
+!variable
+  integer :: iterm1,iterm2
+!array
+  !integer,allocatable :: blkval(:,:)
+  integer :: blkval(2, maxval([c1%nterm, c2%nterm]))
+! *************************************************************************
+  res = .false.
+  blkval = 0
+  do iterm1=1,c1%nterm
+    if(blkval(1,iterm1)==1)cycle!already found
+    do iterm2=1,c2%nterm
+      if(blkval(2,iterm2)==1)cycle!already found
+      if(c1%terms(iterm1)==c2%terms(iterm2)) then
+        blkval(1,iterm1) = 1
+        blkval(2,iterm2) = 1
+      end if
+    end do
+  end do
+  if(.not.any(blkval(:,:)==0))res = .true.
+
+end function coeffs_compare
+!!***
+
+
+!!****f* m_polynomial_coeff/coeffs_list_conc
+!! NAME
+!! coeff_list_conc
+!!
+!! FUNCTION
+!!
+!! Concatenate list1 and list2 of type polynomial_coeff and store it in list_out
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+function coeffs_list_conc(coeff_list1,coeff_list2) result (coeff_list_out)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+  type(polynomial_coeff_type), intent(in) :: coeff_list1(:),coeff_list2(:)
+  type(polynomial_coeff_type) :: coeff_list_out(size(coeff_list1)+size(coeff_list2))
+!local
+!variable
+  integer :: ncoeff1,ncoeff2,ncoeff_out,i,j
+!array
+! *************************************************************************
+
+!Get sizes of coeff_list1/2
+ ncoeff1 = size(coeff_list1)
+ ncoeff2 = size(coeff_list2)
+ ncoeff_out = ncoeff1 + ncoeff2
+
+! ABI_MALLOC(coeff_list_out,(ncoeff_out))
+ do i=1,ncoeff_out
+    if(i<=ncoeff1)then
+       call polynomial_coeff_init(coeff_list1(i)%coefficient,coeff_list1(i)%nterm,coeff_list_out(i),coeff_list1(i)%terms,&
+&                                 coeff_list1(i)%name,check=.TRUE.)
+    else
+       j=i-ncoeff1
+       call polynomial_coeff_init(coeff_list2(j)%coefficient,coeff_list2(j)%nterm,coeff_list_out(i),coeff_list2(j)%terms,&
+&                                 coeff_list2(j)%name,check=.TRUE.)
+    endif
+ enddo
+
+end function coeffs_list_conc
+!!***
+
+
+!!****f* m_polynomial_coeff/coeffs_list_conc_onsite
+!! NAME
+!! coeff_list_conc_onsite
+!!
+!! FUNCTION
+!!
+!! Concatenate list1 and list2 of type polynomial_coeff and store it in list1
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+subroutine coeffs_list_conc_onsite(coeff_list1,coeff_list2)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ type(polynomial_coeff_type), allocatable, intent(inout) :: coeff_list1(:)
+ type(polynomial_coeff_type), intent(in) ::coeff_list2(:)
+ !local
+ !variable
+ integer :: ncoeff1,ncoeff2,ncoeff_out
+ !array
+ type(polynomial_coeff_type), allocatable :: coeff_list_tmp(:)
+ ! *************************************************************************
+
+ ncoeff1=size(coeff_list1)
+ ncoeff2=size(coeff_list2)
+ ncoeff_out = ncoeff1+ncoeff2
+
+ ! copy list1 to tmp
+ ABI_MALLOC(coeff_list_tmp,(ncoeff1))
+ coeff_list_tmp=coeff_list1
+
+ ! allocate new list1
+ call polynomial_coeff_list_free(coeff_list1)
+ ABI_MALLOC(coeff_list1,(ncoeff_out))
+ !coeff_list1=coeff_list_tmp + coeff_list2
+ !coeff_list1 = coeffs_list_conc(coeff_list_tmp, coeff_list2)
+ coeff_list1(1:ncoeff1) = coeff_list_tmp
+ coeff_list1(ncoeff1+1:ncoeff_out) = coeff_list2
+ call polynomial_coeff_list_free(coeff_list_tmp)
+
+end subroutine coeffs_list_conc_onsite
+!!***
+
+
+!!****f* m_polynomial_coeff/coeffs_list_append
+!! NAME
+!! coeff_list_append
+!!
+!! FUNCTION
+!!
+!! append on coeff to the list of coeffs: coeff_list
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+subroutine coeffs_list_append(coeff_list,coeff, check)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ type(polynomial_coeff_type), allocatable, intent(inout) ::coeff_list(:)
+ type(polynomial_coeff_type), intent(inout) :: coeff
+ logical, intent(in) :: check
+ !local variable
+ type(polynomial_coeff_type) :: tmp(size(coeff_list))
+ integer :: n1, n2
+ !array
+ ! *************************************************************************
+
+ n1=size(coeff_list)
+ n2= n1+1
+
+ ! copy list1 to tmp
+ tmp=coeff_list
+
+ ! allocate new list1
+ call polynomial_coeff_list_free(coeff_list)
+ ABI_MALLOC(coeff_list,(n2))
+
+ call coeffs_list_copy(coeff_list, tmp)
+ call polynomial_coeff_init(coeff%coefficient,coeff%nterm,coeff_list(n2),coeff%terms,&
+   &                                 coeff%name,check=check)
+end subroutine coeffs_list_append
+!!***
+
+!!****f* m_polynomial_coeff/coeffs_list_copy
+!! NAME
+!! coeff_list_copy
+!!
+!! FUNCTION
+!!
+!! Copy list1 to list2 of type polynomial_coeff
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+subroutine coeffs_list_copy(coeff_list_out,coeff_list_in)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+  type(polynomial_coeff_type), intent(in) :: coeff_list_in(:)
+  type(polynomial_coeff_type),intent(out) :: coeff_list_out(:)
+!local
+!variable
+  integer :: ncoeff_in,ncoeff_out,ii
+  logical :: check
+  character(len=500):: message
+!array
+! *************************************************************************
+
+ check = .true.
+
+!Get size of coeff_lists
+ ncoeff_in = size(coeff_list_in)
+ ncoeff_out = size(coeff_list_out)
+
+ if(ncoeff_in > ncoeff_out)then
+   write(message,'(a,a,a)')'The input list of polynomial_coefficients is larger',ch10,&
+&                          'than the output list you want it assign to. Check size of lists.'
+   ABI_ERROR(message)
+ endif
+
+ !Copy input list into output lists
+ do ii=1,ncoeff_in
+    call polynomial_coeff_init(coeff_list_in(ii)%coefficient,coeff_list_in(ii)%nterm,&
+&                             coeff_list_out(ii),coeff_list_in(ii)%terms,coeff_list_in(ii)%name,check)
+ enddo
+end subroutine coeffs_list_copy
+!!***
+
+!!****f* m_polynomial_coeff/sort_combination
+!! NAME
+!! sort_combination
+!!
+!! FUNCTION
+!!
+!! Sort a list of integer from small to large if it contains zeros will be put to highest indexe
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+subroutine sort_combination(combination,n_int)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ !scalar
+ integer,intent(in) :: n_int
+ !array
+ integer,intent(inout) :: combination(n_int)
+!local
+!variable
+  integer :: j,k,cnt,tmp_int1,tmp_int2
+!array
+! *************************************************************************
+
+j=2
+do while(j <= n_int)
+   k = j
+   cnt = 1
+   do while(k >= 2 .and. cnt == 1)
+      if(combination(k-1) > combination(k) .and. combination(k) > 0)then
+           tmp_int1 = combination(k-1)
+           tmp_int2 = combination(k)
+           combination(k) = tmp_int1
+           combination(k-1) = tmp_int2
+           k=k-1
+      else
+        cnt = cnt + 1
+      end if
+   end do
+   j = j+1
+end do
+
+end subroutine sort_combination
+!!***
+
+!!****f* m_polynomial_coeff/sort_combination_list
+!! NAME
+!! sort_combination_list
+!!
+!! FUNCTION
+!!
+!! Sort a list of integer list from small to large if it contains zeros will be put to highest index
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+subroutine sort_combination_list(combination_list,n_int,n_list)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ !scalar
+ integer,intent(in) :: n_int,n_list
+ !array
+ integer,intent(inout) :: combination_list(n_int,n_list)
+!local
+!variable
+  integer :: i
+!array
+! *************************************************************************
+
+do i=1,n_list
+   call sort_combination(combination_list(:,i),n_int)
+end do
+
+end subroutine sort_combination_list
+!!***
+
+
+!!****f* m_polynomial_coeff/check_irreducibility
+!! NAME
+!! check_irreducibility
+!!
+!! FUNCTION
+!!
+!! checks irreducibility of combination of terms with respect to crystal symmetry
+!!
+!! INPUTS
+!! combination: combination of integers icoeff representing term A_x-B_x to check
+!! list_combination: list of combination against which combinatino will be checked
+!! list_symcoeff: list of coefficients containig information connecting the integers in combination
+!!                and list_combination to bodies (A_x-B_x) of difference of atomic displacements
+!! list_symstr: list of strain with symmetry properties connecting icoeff>ncoeff_sym to strains of given direction
+!! ncoeff_sym:  number of bodies (A_x-B_x) containing all symmetric equivalents
+!! nsym:        number of symmetries in the crystal system
+!! ncombination: number of combinations -> defines size of list_combination
+!! ndisp:        number of displacements that is maximum order of combinations
+!! index_irred:  list of index of irreducible terms (that are non-zero) in list_combination
+!!
+!!
+!!
+!! OUTPUT
+!!
+!! logical :: irreducible -> TRUE: no other equal term exists in list_combination
+!!                        -> FALSE: a other equivalent term exists already
+!!
+!! SIDE_EFFECT: if combination is irreducible (that means irreducible = .FALSE.) the index of the irreduc!!              irreducible coefficient is added to index_irred
+!! SOURCE
+
+function check_irreducibility(combination,list_combination,list_symcoeff,list_symstr,ncoeff_sym,nsym,&
+&                             ncombination,ndisp,index_irred)  result(irreducible)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ !scalar
+ integer,intent(in) :: ncoeff_sym,ncombination,ndisp,nsym
+ integer,intent(inout),allocatable :: index_irred(:)
+ logical :: irreducible !output
+ !array
+ integer,intent(inout) :: combination(ndisp),list_combination(ndisp,ncombination)
+ integer,intent(in) :: list_symcoeff(6,ncoeff_sym,nsym)
+ integer,intent(in) :: list_symstr(6,nsym,2)
+!local
+!variable
+  integer :: icombi, isym
+!array
+  integer :: combination_cmp_tmp(ndisp)
+  integer,allocatable :: index_irred_tmp(:)
+! *************************************************************************
+ ! sort input combinations
+ !write(std_out,*) "DEBUG call sort_combination_lsit"
+ call sort_combination_list(list_combination,size(list_combination,1),size(list_combination,2))
+ !write(std_out,*) "DEBUG sort_combination in check_irreducibility"
+ call sort_combination(combination,size(combination))
+
+ !Initialize variables
+ icombi = 1
+ irreducible = .TRUE.
+ !do icombi=1,ncombination
+ ! write(std_out,*) "DEBUG: list_combination i:",icombi,": ", list_combination(:,icombi)
+ !enddo
+ !MS DEBUG
+ ! write(std_out,*) "DEBUG: shape(list_combination)", shape(list_combination(:,:))
+ !write(std_out,*) "DEBUG: combination: ", combination
+ !write(std_out,*) "DEBUG: ncombination: ", ncombination
+
+ !Loop over non reducable combinations
+ do while(icombi <= size(index_irred) .and. irreducible .eqv. .TRUE.)
+   !if(all(list_combination(:,index_irred(icombi)) /= 0))then !.and. any(list_combination(:,i) <= ncoeff_symsym))then
+     !If term j is equivalent to term i delete it
+     if(all(list_combination(:,index_irred(icombi)) == combination(:)))then
+        irreducible = .FALSE.
+        return
+     else !else loop over symmetries to find symmetry operation that projects term j on i
+       isym = 2
+       do while(isym <= nsym)
+          !Get equivalent term indexes for symmetry isym
+         call symcomb(combination, combination_cmp_tmp, isym)
+         !Sort the new symmetric indexes for comparision
+         call sort_combination(combination_cmp_tmp,size(combination_cmp_tmp))
+         !Compare. If equivalent break (term not irreducible
+          if(all(list_combination(:,index_irred(icombi)) == combination_cmp_tmp(:)))then
+             irreducible = .FALSE.
+             return
+          else
+             isym = isym + 1
+          endif
+       enddo !isym
+     endif ! all(list_combinaton...)
+   !end if ! any(list_combination /= 0 )
+   icombi = icombi + 1
+end do !i=1,ncombination
+
+!If no equivalent found put ncombination +1 to index of irreducible combis
+ABI_MALLOC(index_irred_tmp,(size(index_irred)))
+index_irred_tmp = index_irred
+ABI_FREE(index_irred)
+ABI_MALLOC(index_irred,(size(index_irred_tmp)+1))
+index_irred(:size(index_irred_tmp)) = index_irred_tmp
+ABI_FREE(index_irred_tmp)
+index_irred(size(index_irred)) = ncombination + 1
+!write(std_out,*) "DEBUG: index_irred", index_irred
+return
+
+contains
+  subroutine symcomb(combination, combination_cmp_tmp, isym)
+    integer, intent(inout) :: combination(:), combination_cmp_tmp(:), isym
+    integer :: idisp, istrain
+    do idisp=1,ndisp
+      if(combination(idisp) /= 0 .and. combination(idisp) <= ncoeff_sym)then
+        combination_cmp_tmp(idisp)=list_symcoeff(6,combination(idisp),isym)
+      else if(combination(idisp) > ncoeff_sym)then
+        istrain = combination(idisp) - ncoeff_sym
+        combination_cmp_tmp(idisp)=list_symstr(istrain,isym,1) + ncoeff_sym
+      else
+        combination_cmp_tmp(idisp) = 0
+      endif
+    enddo
+  end subroutine symcomb
+
+end function check_irreducibility
+!!***
+
+!!****f* m_polynomial_coeff/reduce_zero_combinations
+!! NAME
+!! reduce_zero_combinations
+!!
+!! FUNCTION
+!!
+!! Sort out list of zeros in a list of integers
+!!
+!! INPUTS
+!!
+!! OUTPUT
+!!
+!! SOURCE
+
+subroutine reduce_zero_combinations(combination_list)
+!Arguments ------------------------------------
+ implicit none
+
+!Arguments ------------------------------------
+ !scalar
+ !array
+ integer,allocatable,intent(inout) :: combination_list(:,:)
+!local
+!variable
+  integer :: i,j
+  integer,allocatable :: combination_list_tmp(:,:)
+!array
+! *************************************************************************
+
+ !Reduce zero combinations
+ i = 0
+ do j=1,size(combination_list,2)
+   if(any(combination_list(:,j) /= 0))then
+      i = i + 1
+   endif
+ enddo
+
+ ABI_MALLOC(combination_list_tmp,(size(combination_list,1),i))
+ i = 0
+ do j=1,size(combination_list,2)
+   if(any(combination_list(:,j) /= 0))then
+      i = i + 1
+      combination_list_tmp(:,i) = combination_list(:,j)
+   endif
+ enddo
+ ABI_FREE(combination_list)
+ ABI_MALLOC(combination_list,(size(combination_list_tmp,1),i))
+ combination_list = combination_list_tmp
+ ABI_FREE(combination_list_tmp)
+
+end subroutine reduce_zero_combinations
+!!***
+
+function find_irpt(cells, cell) result(my_irpt)
+  integer, intent(in) :: cells(:, :), cell(:)
+  integer :: my_irpt, i
+  my_irpt=-1
+  do i =1, size(cells, 2)
+    if (all(cell==cells(:, i))) my_irpt=i
+  end do
+  if(my_irpt==-1) ABI_BUG("cell not found.")
+end function find_irpt
+
+! for one r in a list of rpts, find the index of -r
+function find_opposite_irpt(cells, irpt) result(n)
+  integer, intent(in) :: cells(:, :), irpt
+  integer :: n
+  n=find_irpt(cells, -cells(:, irpt))
+end function find_opposite_irpt
+
+subroutine SymPairs_t_init(self, crystal, sc_size, fit_iatom_in, cutoff_in)
+  class(SymPairs_t), intent(inout) ::self
+  type(crystal_t), target, intent(inout) :: crystal
+  integer, intent(in) :: sc_size(3)
+  integer, intent(in), optional :: fit_iatom_in
+  real(dp), intent(in), optional :: cutoff_in
+  self%crystal=> crystal
+  self%sc_size(:) = sc_size(:)
+  if(present(fit_iatom_in)) then
+    self%fit_iatom = fit_iatom_in
+  else
+    self%fit_iatom = -1
+  end if
+  if(present(cutoff_in)) then
+    self%cutoff=cutoff_in
+  else
+    self%cutoff=get_crystal_cutoff(crystal)
+  end if
+
+  call prepare_for_getList(crystal, sc_size, self%dist, self%cell, self%natom, self%nsym, self%nrpt, self%range_ifc, self%symbols)
+  call polynomial_coeff_getList(self%cell,self%crystal,self%dist, &
+    &self%list_symcoeff,self%list_symstr,&
+    &self%natom,self%nstr_sym,self%ncoeff_sym,self%nrpt, &
+    &self%range_ifc,self%cutoff,sc_size=self%sc_size,&
+    &fit_iatom=fit_iatom_in)
+
+
+end subroutine SymPairs_t_init
+
+subroutine SymPairs_t_free(self)
+  class(SymPairs_t), intent(inout) ::self
+  nullify(self%crystal)
+  ABI_FREE(self%list_symcoeff)
+  ABI_FREE(self%list_symstr)
+  ABI_FREE(self%cell)
+  ABI_FREE(self%dist)
+  ABI_FREE(self%symbols)
+end subroutine SymPairs_t_free
+
+subroutine SymPairs_t_generateTerms(self, index_coeff,  power, nterm, terms, reverse)
+  class(SymPairs_t), intent(inout) ::self
+  integer,intent(in) ::  index_coeff(:)
+  integer, intent(in) :: power
+  integer, intent(out) :: nterm
+  type(polynomial_term_type),intent(out) :: terms(self%nsym)
+  logical, optional, intent(in) :: reverse(power)
+  logical  :: reverse_a(power)
+  integer :: ndisp_max
+  if(present(reverse))then
+    reverse_a(:) = reverse(:)
+  else
+    reverse_a(:) = .False.
+  end if
+  ndisp_max=size(index_coeff)
+  ! Note that ncoeff_sym is not the same as ncoeff_symsym
+  call generateTermsFromList(self%cell,index_coeff,self%list_symcoeff, &
+    &self%list_symstr,size(self%list_symcoeff, 2),power,self%nrpt,self%nstr_sym,self%nsym, &
+    &nterm,terms, reverse=reverse_a)
+end subroutine SymPairs_t_generateTerms
+
+subroutine IrreducibleCombinations_init(self)
+  class(IrreducibleCombinations_t), intent(inout) :: self
+  call self%table%init(757)
+end subroutine IrreducibleCombinations_init
+
+subroutine IrreducibleCombinations_free(self)
+  class(IrreducibleCombinations_t), intent(inout) :: self
+  call self%table%free()
+  call self%array%finalize()
+end subroutine IrreducibleCombinations_free
+
+function IrreducibleCombinations_add_irr(self, combination, list_symcoeff, &
+  & list_symstr, ncoeff_sym, nsym, ndisp ) result(irreducible)
+  class(IrreducibleCombinations_t), intent(inout) :: self
+  integer, intent(inout) :: combination(:)
+  integer,intent(in) :: ncoeff_sym,ndisp,nsym
+  integer,intent(in) :: list_symcoeff(6,ncoeff_sym,nsym)
+  integer,intent(in) :: list_symstr(6,nsym,2)
+
+  integer :: combination_cmp_tmp(ndisp), combination_sorted(ndisp)
+  logical :: irreducible
+  integer :: n, isym
+  ! check if the combination, or its symmetry equivalent are already in the
+  ! table. If not, add it to the table.
+  irreducible=.True.
+  combination_sorted(:)=combination(:)
+  call sort_combination(combination_sorted,size(combination))
+  n=size(combination)
+  if ( self%table%has_key_intn(combination_sorted, n)) then
+    irreducible=.False.
+    return
+  else
+    isym = 2
+    do while(isym <= nsym)
+      call symcomb(combination_sorted, combination_cmp_tmp, isym)
+      call sort_combination(combination_cmp_tmp,size(combination_cmp_tmp))
+      if ( self%table%has_key_intn(combination_cmp_tmp, n)) then
+        irreducible=.False.
+        return
+      else
+        isym = isym + 1
+      end if
+    end do
+  end if
+  !if (self%array%size==0) irreducible=.False.
+  call self%table%put_intn(combination_sorted, 0.0_dp, n)
+  call self%array%push(combination)
+contains
+  subroutine symcomb(combination, combination_cmp_tmp, isym)
+    integer :: combination(:), combination_cmp_tmp(:), isym
+    integer :: idisp, istrain
+    do idisp=1,ndisp
+      if(combination(idisp) /= 0 .and. combination(idisp) <= ncoeff_sym)then
+        combination_cmp_tmp(idisp)=list_symcoeff(6,combination(idisp),isym)
+      else if(combination(idisp) > ncoeff_sym)then
+        istrain = combination(idisp) - ncoeff_sym
+        combination_cmp_tmp(idisp)=list_symstr(istrain,isym,1) + ncoeff_sym
+      else
+        combination_cmp_tmp(idisp) = 0
+      endif
+    enddo
+  end subroutine symcomb
+end function IrreducibleCombinations_add_irr
+
+
+
+end module m_polynomial_coeff
+!!***

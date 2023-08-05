@@ -6,6 +6,7 @@ sources=files(
            'm_linalg_interfaces.F90',
            'm_abicore.F90',
            'm_clib.F90',
+           'm_xmpi.F90',
            'defs_basis.F90',
            'm_symtk.F90',
            'm_io_tools.F90',

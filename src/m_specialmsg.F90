@@ -24,6 +24,7 @@ module m_specialmsg
 
  use defs_basis
  use m_build_info
+ use m_xmpi
 
  use m_io_tools,   only : flush_unit, write_lines, is_open
 

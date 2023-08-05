@@ -43,9 +43,9 @@ include_directories(include)
 
 file(GLOB sourcefile
     "include/*.h"
-    "src/*.F90"
-    "src/xmpi/*.F90"
-    "src/xmpi/*.finc")
+    "src/abinit/*.F90"
+    "src/abinit/xmpi/*.F90"
+    "src/abinit/xmpi/*.finc")
 
 #target_include_directories(dipdip PRIVATE "include")
 
